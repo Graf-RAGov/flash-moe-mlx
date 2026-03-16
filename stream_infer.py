@@ -441,13 +441,14 @@ def read_expert_packed(packed_fd, layout, expert_idx):
     offset = expert_idx * expert_size
 
     t_io = time.time()
-    raw = os.pread(packed_fd, expert_size, offset)
+    raw = os.pread(packed_fd, expert_size, offset)  # 1 read, 7.08MB contiguous
     io_time = time.time() - t_io
 
     t_arr = time.time()
     results = {}
+    mv = memoryview(raw)  # zero-copy view for slicing
     for comp in layout["components"]:
-        name = comp["name"]  # e.g. "gate_proj.weight"
+        name = comp["name"]
         parts = name.split(".")
         proj_name, attr_name = parts[0], parts[1]
         comp_offset = comp["offset"]
@@ -455,7 +456,7 @@ def read_expert_packed(packed_fd, layout, expert_idx):
         dtype_str = comp["dtype"]
         shape = comp["shape"]
 
-        chunk = raw[comp_offset:comp_offset + comp_size]
+        chunk = mv[comp_offset:comp_offset + comp_size]  # zero-copy slice
         np_dtype, _ = _PREAD_NP_DTYPE[dtype_str]
         np_arr = np.frombuffer(chunk, dtype=np_dtype).reshape(shape)
 
