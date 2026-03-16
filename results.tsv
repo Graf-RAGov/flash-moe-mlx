@@ -36,3 +36,4 @@ b52d187	Qwen3.5-397B-A17B-4bit	397.0	17.0	2.05	3068	5.9	keep	packed layers 0-8 +
 a5a969f	Qwen3.5-397B-A17B-4bit	397.0	17.0	2.49	2712	5.5	keep	ALL 60 layers packed + no-cache + K=4 - I/O 205ms, 240 seeks, 3.5GB/s, BEST
 9a261c3	Qwen3.5-397B-A17B-4bit	397.0	17.0	2.49	3313	2.1	keep	C ext packed + no-cache K=4 - same speed as mmap packed, only 2.1GB RAM
 9a261c3	Qwen3.5-397B-A17B-4bit	397.0	17.0	2.27	3961	28.5	discard	pin-experts(20warm,top20) - 31% pin hit (routing diverged), 28.5GB Metal overhead
+84dbb24	Qwen3.5-397B-A17B-4bit	397.0	17.0	3.10	2614	5.3	keep	FULL STACK: packed+no-cache+K=4+batch+lazy-eval+pipeline — 280ms/tok, 3.10 tok/s
