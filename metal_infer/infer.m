@@ -137,6 +137,14 @@ typedef struct {
 static LayerTimingAccum g_timing = {0};
 static int g_timing_enabled = 0;
 
+// ============================================================================
+// Expert frequency tracking (diagnostic: --freq flag)
+// ============================================================================
+
+static int g_expert_freq[NUM_LAYERS][NUM_EXPERTS];  // activation count per (layer, expert)
+static int g_freq_tracking = 0;  // enabled by --freq flag
+static int g_freq_total_tokens = 0;  // total tokens processed while tracking
+
 static void timing_reset(void) {
     memset(&g_timing, 0, sizeof(g_timing));
 }
@@ -2939,6 +2947,140 @@ static id<MTLBuffer> expert_cache_insert(ExpertLRUCache *cache, int layer_idx, i
 }
 
 // ============================================================================
+// Malloc-based expert frequency cache.
+// Stores expert data in regular malloc'd memory (not Metal buffers) to avoid
+// GPU memory pressure. On hit, memcpy to Metal scratch buffer. Much larger
+// capacity than Metal buffer LRU cache at the cost of one memcpy per hit.
+// ============================================================================
+
+typedef struct {
+    void **data;           // [max_entries] page-aligned malloc'd EXPERT_SIZE buffers
+    id<MTLBuffer> __strong *metal_bufs;  // [max_entries] zero-copy Metal buffer wrappers
+    int *layer_idx;        // [max_entries] layer index for each entry
+    int *expert_idx;       // [max_entries] expert index for each entry
+    uint64_t *last_used;   // [max_entries] monotonic counter for LRU
+    int max_entries;
+    int num_entries;
+    uint64_t access_counter;
+    uint64_t hits;
+    uint64_t misses;
+} MallocExpertCache;
+
+static MallocExpertCache *g_malloc_cache = NULL;
+
+static MallocExpertCache *malloc_cache_init(int max_entries, id<MTLDevice> device) {
+    MallocExpertCache *cache = calloc(1, sizeof(MallocExpertCache));
+    cache->data = calloc(max_entries, sizeof(void *));
+    cache->metal_bufs = (__strong id<MTLBuffer> *)calloc(max_entries, sizeof(id<MTLBuffer>));
+    cache->layer_idx = calloc(max_entries, sizeof(int));
+    cache->expert_idx = calloc(max_entries, sizeof(int));
+    cache->last_used = calloc(max_entries, sizeof(uint64_t));
+    cache->max_entries = max_entries;
+    cache->num_entries = 0;
+    cache->access_counter = 0;
+    cache->hits = 0;
+    cache->misses = 0;
+
+    printf("[malloc_cache] Initializing: %d entries (%.1f GB) with zero-copy Metal wrappers\n",
+           max_entries, (double)max_entries * EXPERT_SIZE / 1e9);
+    double t_start = now_ms();
+
+    size_t page_size = (size_t)getpagesize();
+    // Round EXPERT_SIZE up to page boundary for newBufferWithBytesNoCopy
+    size_t aligned_size = (EXPERT_SIZE + page_size - 1) & ~(page_size - 1);
+
+    for (int i = 0; i < max_entries; i++) {
+        // Page-aligned allocation for zero-copy Metal buffer
+        void *buf = NULL;
+        if (posix_memalign(&buf, page_size, aligned_size) != 0 || !buf) {
+            fprintf(stderr, "WARNING: malloc_cache: alloc failed at entry %d\n", i);
+            max_entries = i;
+            cache->max_entries = i;
+            break;
+        }
+        memset(buf, 0, aligned_size);
+        cache->data[i] = buf;
+
+        // Create zero-copy Metal buffer wrapping the malloc'd memory
+        // nil deallocator = Metal doesn't free the memory
+        cache->metal_bufs[i] = [device newBufferWithBytesNoCopy:buf
+                                                         length:aligned_size
+                                                        options:MTLResourceStorageModeShared
+                                                    deallocator:nil];
+        cache->layer_idx[i] = -1;
+        cache->expert_idx[i] = -1;
+        cache->last_used[i] = 0;
+    }
+    cache->num_entries = max_entries;
+
+    printf("[malloc_cache] Pre-allocated %d entries in %.0f ms\n",
+           max_entries, now_ms() - t_start);
+    return cache;
+}
+
+// Lookup: returns Metal buffer wrapping cached data, or nil. Zero-copy dispatch.
+static id<MTLBuffer> malloc_cache_lookup(MallocExpertCache *cache, int layer, int expert) {
+    for (int i = 0; i < cache->num_entries; i++) {
+        if (cache->layer_idx[i] == layer && cache->expert_idx[i] == expert) {
+            cache->last_used[i] = ++cache->access_counter;
+            cache->hits++;
+            return cache->metal_bufs[i];
+        }
+    }
+    cache->misses++;
+    return nil;
+}
+
+// Insert: evict LRU if needed, return entry index for pread target.
+// Returns the Metal buffer for this entry (caller should pread into cache->data[idx]).
+static id<MTLBuffer> malloc_cache_insert(MallocExpertCache *cache, int layer, int expert, int *out_idx) {
+    // Find a free slot (layer_idx == -1) or evict LRU
+    int target = -1;
+    for (int i = 0; i < cache->num_entries; i++) {
+        if (cache->layer_idx[i] == -1) {
+            target = i;
+            break;
+        }
+    }
+
+    if (target < 0) {
+        // Cache full: evict entry with smallest last_used
+        target = 0;
+        uint64_t min_used = cache->last_used[0];
+        for (int i = 1; i < cache->num_entries; i++) {
+            if (cache->last_used[i] < min_used) {
+                min_used = cache->last_used[i];
+                target = i;
+            }
+        }
+    }
+
+    cache->layer_idx[target] = layer;
+    cache->expert_idx[target] = expert;
+    cache->last_used[target] = ++cache->access_counter;
+    if (out_idx) *out_idx = target;
+    return cache->metal_bufs[target];
+}
+
+static void malloc_cache_free(MallocExpertCache *cache) {
+    if (!cache) return;
+    printf("[malloc_cache] Final stats: %llu hits, %llu misses (%.1f%% hit rate)\n",
+           cache->hits, cache->misses,
+           (cache->hits + cache->misses) > 0
+               ? 100.0 * cache->hits / (cache->hits + cache->misses) : 0.0);
+    for (int i = 0; i < cache->num_entries; i++) {
+        cache->metal_bufs[i] = nil;  // release Metal buffer wrapper
+        free(cache->data[i]);
+    }
+    free(cache->data);
+    free(cache->metal_bufs);
+    free(cache->layer_idx);
+    free(cache->expert_idx);
+    free(cache->last_used);
+    free(cache);
+}
+
+// ============================================================================
 // Background prefetch thread for double-buffered expert I/O (from main.m).
 // Runs pread on a background thread while main thread does GPU compute.
 // Uses pure C I/O plan to avoid ARC issues across threads.
@@ -4056,6 +4198,12 @@ static void fused_layer_forward(
     float expert_weights[64];
     cpu_topk(gate_scores, NUM_EXPERTS, K, expert_indices, expert_weights);
     cpu_normalize_weights(expert_weights, K);
+    if (g_freq_tracking) {
+        for (int k = 0; k < K; k++) {
+            g_expert_freq[layer_idx][expert_indices[k]]++;
+        }
+        if (layer_idx == 0) g_freq_total_tokens++;
+    }
     if (g_timing_enabled) { t1 = now_ms(); g_timing.routing_cpu += t1 - t0; }
 
     // ---- Parallel pread + GPU experts ----
@@ -4077,8 +4225,59 @@ static void fused_layer_forward(
         int valid[MAX_K];
         id<MTLBuffer> expert_bufs[MAX_K];  // buffer to dispatch from per expert
 
-        if (g_expert_cache) {
-            // ---- LRU cache path ----
+        if (g_malloc_cache) {
+            // ---- Malloc cache path (zero-copy Metal buffer wrappers) ----
+            // Phase 1: check cache for each expert, collect misses
+            int miss_indices[MAX_K];
+            int miss_cache_idx[MAX_K];  // cache entry index for each miss
+            int num_misses = 0;
+
+            for (int k = 0; k < actual_K; k++) {
+                id<MTLBuffer> cached = malloc_cache_lookup(g_malloc_cache, layer_idx, expert_indices[k]);
+                if (cached) {
+                    // Cache hit: zero-copy dispatch directly from cache buffer
+                    expert_bufs[k] = cached;
+                    valid[k] = 1;
+                } else {
+                    // Cache miss: insert entry (get buffer to pread into)
+                    int cidx = -1;
+                    id<MTLBuffer> buf = malloc_cache_insert(g_malloc_cache, layer_idx, expert_indices[k], &cidx);
+                    expert_bufs[k] = buf;
+                    miss_indices[num_misses] = k;
+                    miss_cache_idx[num_misses] = cidx;
+                    num_misses++;
+                    valid[k] = 0;
+                }
+            }
+
+            // Phase 2: parallel pread misses directly into cache buffers (zero-copy)
+            if (num_misses > 0) {
+                InferPreadTask tasks[MAX_K];
+                for (int m = 0; m < num_misses; m++) {
+                    int k = miss_indices[m];
+                    int cidx = miss_cache_idx[m];
+                    tasks[m].fd = packed_fd;
+                    tasks[m].dst = g_malloc_cache->data[cidx];  // pread into cache backing memory
+                    tasks[m].offset = (off_t)expert_indices[k] * EXPERT_SIZE;
+                    tasks[m].size = EXPERT_SIZE;
+                    tasks[m].result = 0;
+                    tasks[m].mmap_base = NULL;  // always pread for cache population
+                }
+
+                io_pool_dispatch(tasks, num_misses);
+
+                // Mark valid
+                for (int m = 0; m < num_misses; m++) {
+                    int k = miss_indices[m];
+                    valid[k] = (tasks[m].result == EXPERT_SIZE);
+                    if (!valid[k]) {
+                        fprintf(stderr, "WARNING: expert %d pread: %zd/%d\n",
+                                expert_indices[k], tasks[m].result, EXPERT_SIZE);
+                    }
+                }
+            }
+        } else if (g_expert_cache) {
+            // ---- Metal buffer LRU cache path ----
             // Phase 1: check cache for each expert, collect misses
             int miss_indices[MAX_K];       // indices into expert_indices[] for misses
             id<MTLBuffer> miss_bufs[MAX_K]; // cache buffers to pread into
@@ -4301,6 +4500,81 @@ static void fused_layer_forward(
 // Main inference loop
 // ============================================================================
 
+// ============================================================================
+// Expert frequency analysis (--freq)
+// ============================================================================
+
+static int freq_cmp_desc(const void *a, const void *b) {
+    return *(const int *)b - *(const int *)a;
+}
+
+static void freq_print_analysis(int K) {
+    if (!g_freq_tracking || g_freq_total_tokens == 0) return;
+
+    int total_activations_per_layer = g_freq_total_tokens * K;
+
+    fprintf(stderr, "\n=== Expert Frequency Analysis ===\n");
+    fprintf(stderr, "Tokens tracked: %d, K=%d, activations/layer=%d\n\n",
+            g_freq_total_tokens, K, total_activations_per_layer);
+
+    // Per-layer analysis
+    int experts_for_80_total = 0;  // sum across layers for overall estimate
+
+    for (int l = 0; l < NUM_LAYERS; l++) {
+        // Count unique experts and sort frequencies descending
+        int sorted[NUM_EXPERTS];
+        memcpy(sorted, g_expert_freq[l], NUM_EXPERTS * sizeof(int));
+        qsort(sorted, NUM_EXPERTS, sizeof(int), freq_cmp_desc);
+
+        int unique = 0;
+        for (int e = 0; e < NUM_EXPERTS; e++) {
+            if (sorted[e] > 0) unique++;
+        }
+
+        // Compute cumulative coverage thresholds
+        int cum = 0;
+        int top10_cov = 0, top30_cov = 0, top60_cov = 0;
+        int n_for_50 = 0, n_for_80 = 0, n_for_90 = 0;
+        for (int e = 0; e < NUM_EXPERTS; e++) {
+            cum += sorted[e];
+            if (e == 9)  top10_cov = cum;
+            if (e == 29) top30_cov = cum;
+            if (e == 59) top60_cov = cum;
+            if (n_for_50 == 0 && cum * 100 >= total_activations_per_layer * 50)
+                n_for_50 = e + 1;
+            if (n_for_80 == 0 && cum * 100 >= total_activations_per_layer * 80)
+                n_for_80 = e + 1;
+            if (n_for_90 == 0 && cum * 100 >= total_activations_per_layer * 90)
+                n_for_90 = e + 1;
+        }
+
+        double pct10 = 100.0 * top10_cov / total_activations_per_layer;
+        double pct30 = 100.0 * top30_cov / total_activations_per_layer;
+        double pct60 = 100.0 * top60_cov / total_activations_per_layer;
+
+        fprintf(stderr, "Layer %2d: %3d unique experts, "
+                "top-10 cover %.0f%%, top-30 cover %.0f%%, top-60 cover %.0f%% "
+                "(50%%@%d, 80%%@%d, 90%%@%d)\n",
+                l, unique, pct10, pct30, pct60, n_for_50, n_for_80, n_for_90);
+
+        experts_for_80_total += n_for_80;
+    }
+
+    // Overall summary: average experts needed for 80% across all layers
+    double avg_experts_80 = (double)experts_for_80_total / NUM_LAYERS;
+    // Expert size in GB: each expert is EXPERT_SIZE bytes (4-bit packed)
+    double expert_gb = (double)EXPERT_SIZE / (1024.0 * 1024.0 * 1024.0);
+    double total_pin_gb = avg_experts_80 * NUM_LAYERS * expert_gb;
+
+    fprintf(stderr, "\n--- Overall Summary ---\n");
+    fprintf(stderr, "To achieve 80%% hit rate across all layers, need %d experts pinned "
+            "(avg %.0f/layer, %.2f GB)\n",
+            experts_for_80_total, avg_experts_80, total_pin_gb);
+    fprintf(stderr, "Expert size: %d bytes (%.3f MB), %d layers x %d experts = %d total\n",
+            EXPERT_SIZE, (double)EXPERT_SIZE / (1024.0 * 1024.0),
+            NUM_LAYERS, NUM_EXPERTS, NUM_LAYERS * NUM_EXPERTS);
+}
+
 static void print_usage(const char *prog) {
     printf("Usage: %s [options]\n", prog);
     printf("  --model PATH         Model path\n");
@@ -4312,7 +4586,9 @@ static void print_usage(const char *prog) {
     printf("  --tokens N           Max tokens to generate (default: 20)\n");
     printf("  --k N                Active experts per layer (default: 4)\n");
     printf("  --cache-entries N    Expert LRU cache size (default: 1500, 0 = disabled)\n");
+    printf("  --malloc-cache N     Malloc expert cache entries (e.g., 2581 = 17GB for 80%% hit)\n");
     printf("  --timing             Enable per-layer timing breakdown\n");
+    printf("  --freq               Enable expert frequency tracking + analysis\n");
     printf("  --help               This message\n");
 }
 
@@ -4327,6 +4603,7 @@ int main(int argc, char **argv) {
         int max_tokens = 20;
         int K = 4;
         int cache_entries = 1500;  // default 1500 entries (override with --cache-entries)
+        int malloc_cache_entries = 0;  // 0 = disabled (override with --malloc-cache)
 
         static struct option long_options[] = {
             {"model",         required_argument, 0, 'm'},
@@ -4337,15 +4614,17 @@ int main(int argc, char **argv) {
             {"prompt",        required_argument, 0, 'P'},
             {"tokens",        required_argument, 0, 't'},
             {"k",             required_argument, 0, 'k'},
-            {"cache-entries", required_argument, 0, 'C'},
+            {"cache-entries",  required_argument, 0, 'C'},
+            {"malloc-cache",   required_argument, 0, 'M'},
             {"skip-linear",   no_argument,       0, 'S'},
             {"timing",        no_argument,       0, 'T'},
+            {"freq",          no_argument,       0, 'F'},
             {"help",          no_argument,       0, 'h'},
             {0, 0, 0, 0}
         };
 
         int c;
-        while ((c = getopt_long(argc, argv, "m:w:j:v:p:P:t:k:C:STh", long_options, NULL)) != -1) {
+        while ((c = getopt_long(argc, argv, "m:w:j:v:p:P:t:k:C:M:STFh", long_options, NULL)) != -1) {
             switch (c) {
                 case 'm': model_path = optarg; break;
                 case 'w': weights_path = optarg; break;
@@ -4356,8 +4635,10 @@ int main(int argc, char **argv) {
                 case 't': max_tokens = atoi(optarg); break;
                 case 'k': K = atoi(optarg); break;
                 case 'C': cache_entries = atoi(optarg); break;
+                case 'M': malloc_cache_entries = atoi(optarg); break;
                 case 'S': linear_attn_bypass = 1; break;
                 case 'T': g_timing_enabled = 1; break;
+                case 'F': g_freq_tracking = 1; break;
                 case 'h': print_usage(argv[0]); return 0;
                 default:  print_usage(argv[0]); return 1;
             }
@@ -4405,6 +4686,12 @@ int main(int argc, char **argv) {
         // ---- Initialize persistent I/O thread pool ----
         io_pool_init();
 
+        // ---- Initialize malloc expert cache (if requested) ----
+        if (malloc_cache_entries > 0) {
+            g_malloc_cache = malloc_cache_init(malloc_cache_entries, g_metal ? g_metal->device : MTLCreateSystemDefaultDevice());
+            cache_entries = 0;  // disable Metal LRU cache when malloc cache is active
+        }
+
         // ---- Initialize expert LRU cache ----
         if (cache_entries > 0 && g_metal) {
             g_expert_cache = expert_cache_new(g_metal->device, cache_entries);
@@ -4417,8 +4704,13 @@ int main(int argc, char **argv) {
         printf("Vocab:    %s\n", vocab_path);
         printf("K:        %d experts/layer\n", K);
         printf("Tokens:   %d\n", max_tokens);
-        printf("Cache:    %d entries%s\n", cache_entries,
-               cache_entries > 0 ? "" : " (disabled)");
+        if (g_malloc_cache) {
+            printf("Cache:    malloc %d entries (%.1f GB)\n",
+                   malloc_cache_entries, (double)malloc_cache_entries * EXPERT_SIZE / 1e9);
+        } else {
+            printf("Cache:    %d entries%s\n", cache_entries,
+                   cache_entries > 0 ? "" : " (disabled)");
+        }
 
         double t0 = now_ms();
 
@@ -4720,8 +5012,14 @@ int main(int argc, char **argv) {
                    g_expert_cache->num_entries, g_expert_cache->max_entries);
         }
 
+        if (g_freq_tracking) freq_print_analysis(K);
+
         // ---- Cleanup ----
         io_pool_shutdown();
+        if (g_malloc_cache) {
+            malloc_cache_free(g_malloc_cache);
+            g_malloc_cache = NULL;
+        }
         if (g_expert_cache) {
             expert_cache_free(g_expert_cache);
             g_expert_cache = NULL;

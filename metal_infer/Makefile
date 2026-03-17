@@ -15,7 +15,7 @@
 # MTLDevice newLibraryWithSource:, so no offline metal compiler needed.
 
 CC = clang
-CFLAGS = -O2 -Wall -Wextra -fobjc-arc
+CFLAGS = -O2 -Wall -Wextra -fobjc-arc -DACCELERATE_NEW_LAPACK
 FRAMEWORKS = -framework Metal -framework Foundation -framework Accelerate
 LDFLAGS = -lpthread
 
