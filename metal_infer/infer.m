@@ -4915,6 +4915,7 @@ static void freq_print_analysis(int K) {
             NUM_LAYERS, NUM_EXPERTS, NUM_LAYERS * NUM_EXPERTS);
 }
 
+#ifndef CHAT_MODE
 static void print_usage(const char *prog) {
     printf("Usage: %s [options]\n", prog);
     printf("  --model PATH         Model path\n");
@@ -5392,3 +5393,4 @@ int main(int argc, char **argv) {
         return 0;
     }
 }
+#endif // CHAT_MODE

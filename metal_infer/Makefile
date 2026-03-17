@@ -9,6 +9,7 @@
 #   make moebench — benchmark MoE (10 iterations)
 #   make full     — full 60-layer MoE forward pass (K=4)
 #   make fullbench — benchmark full 60-layer forward (3 iterations)
+#   make chat     — build interactive chat TUI
 #   make clean    — remove build artifacts
 #
 # Note: Metal shaders are compiled from source at runtime via
@@ -33,7 +34,11 @@ SHADER_LIB = shaders.metallib
 INFER_TARGET = infer
 INFER_SRC = infer.m
 
-.PHONY: all clean run verify bench moe moebench full fullbench fast metallib infer infer-run
+# Chat TUI (interactive multi-turn)
+CHAT_TARGET = chat
+CHAT_SRC = chat.m
+
+.PHONY: all clean run verify bench moe moebench full fullbench fast metallib infer infer-run chat-run build-chat
 
 all: $(TARGET) $(INFER_TARGET)
 
@@ -54,8 +59,12 @@ $(SHADER_LIB): $(SHADER_AIR)
 $(INFER_TARGET): $(INFER_SRC)
 	$(CC) $(CFLAGS) $(FRAMEWORKS) $(LDFLAGS) $(INFER_SRC) -o $(INFER_TARGET)
 
+# Build the chat TUI
+$(CHAT_TARGET): $(CHAT_SRC) $(INFER_SRC)
+	$(CC) $(CFLAGS) $(FRAMEWORKS) $(LDFLAGS) $(CHAT_SRC) -o $(CHAT_TARGET)
+
 clean:
-	rm -f $(TARGET) $(INFER_TARGET) $(SHADER_AIR) $(SHADER_LIB)
+	rm -f $(TARGET) $(INFER_TARGET) $(CHAT_TARGET) $(SHADER_AIR) $(SHADER_LIB)
 
 # Run targets
 run: $(TARGET)
@@ -87,3 +96,8 @@ build-infer: $(INFER_TARGET)
 
 infer-run: $(INFER_TARGET)
 	./$(INFER_TARGET) --prompt "Hello, what is" --tokens 20 --k 4
+
+# Chat TUI targets (use: make chat)
+
+chat-run: $(CHAT_TARGET)
+	./$(CHAT_TARGET) --k 4
