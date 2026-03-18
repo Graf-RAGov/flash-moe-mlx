@@ -309,6 +309,31 @@ static void md_print(const char *text) {
             continue;
         }
 
+        // Bullet lists at line start: - item or * item → • item
+        if (g_md.line_start && (c == '-' || c == '*') && text[i+1] == ' ') {
+            printf("  \033[33m•\033[0m");  // yellow bullet
+            i++; // skip the space
+            g_md.line_start = 0;
+            continue;
+        }
+
+        // Numbered lists at line start: 1. item → colored number
+        if (g_md.line_start && c >= '0' && c <= '9') {
+            int num_start = i;
+            while (text[i] >= '0' && text[i] <= '9') i++;
+            if (text[i] == '.' && text[i+1] == ' ') {
+                printf("  \033[33m");  // yellow
+                for (int j = num_start; j <= i; j++) putchar(text[j]);
+                printf("\033[0m");
+                i++; // skip space
+                g_md.line_start = 0;
+                continue;
+            }
+            // Not a list, rewind and print normally
+            i = num_start;
+            c = text[i];
+        }
+
         // Bold: **
         if (c == '*' && text[i+1] == '*') {
             if (g_md.bold) {
