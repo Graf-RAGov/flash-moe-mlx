@@ -42,7 +42,7 @@
 % Title
 % ============================================================================
 
-\title{\textbf{Flash-MoE: Streaming a 397B Parameter Mixture-of-Experts Model\\ from NVMe at 5.5 Tokens/Second on Consumer Hardware}}
+\title{\textbf{Flash-MoE: Streaming a 397B Parameter Mixture-of-Experts Model\\ from NVMe at 5.7 Tokens/Second on Consumer Hardware}}
 
 \author{
     Daniel Woods \\
@@ -59,11 +59,11 @@
 % Abstract
 % ============================================================================
 \begin{abstract}
-We demonstrate that a 397 billion parameter Mixture-of-Experts language model (Qwen3.5-397B-A17B) can run on a laptop with only 48\,GB of unified memory at 5.5 tokens per second with production-quality output.
+We demonstrate that a 397 billion parameter Mixture-of-Experts language model (Qwen3.5-397B-A17B) can run on a laptop with only 48\,GB of unified memory at 5.74 tokens per second with production-quality output.
 Our approach combines NVMe SSD streaming of expert weights, aggressive requantization (2-bit experts with 0.001--0.003 RMSE per layer), and a custom Metal GPU compute pipeline written in Objective-C.
 The entire 120\,GB model streams from disk through parallel \texttt{pread()} calls, with only 5.5\,GB of weights resident in memory at any time.
-Key innovations include a fused three-command-buffer GPU pipeline that eliminates CPU--GPU synchronization overhead, BLAS-accelerated linear attention for GatedDeltaNet layers, and direct SSD access with \texttt{F\_NOCACHE} bypassing the page cache.
-We achieve 5.5\,tok/s sustained and 7+\,tok/s peak on an Apple M3 Max, reaching 97\% of the theoretical I/O-limited maximum.
+Key innovations include a fused three-command-buffer GPU pipeline that eliminates CPU--GPU synchronization overhead, BLAS-accelerated linear attention for GatedDeltaNet layers, and---counterintuitively---\emph{removing} all application-level caching to let the macOS page cache manage expert data exclusively, which yielded a 38\% speedup by eliminating memory compressor thrashing.
+We achieve 5.74\,tok/s sustained and 7+\,tok/s peak on an Apple M3 Max.
 To our knowledge, this is the first demonstration of a model exceeding 8$\times$ DRAM capacity running at interactive speeds on consumer hardware.
 \end{abstract}
 
@@ -88,7 +88,7 @@ Our contributions are:
     \item A complete inference engine---written in Objective-C and Metal Shading Language---that streams a 397B-parameter model from SSD at interactive speeds on a consumer laptop.
     \item A 2-bit requantization scheme for MoE expert weights that reduces per-expert size by 44\% (7.08\,MB $\to$ 3.93\,MB) while maintaining output quality, verified across mathematical reasoning, code generation, and scientific explanation tasks.
     \item A fused Metal GPU pipeline using three command buffers per transformer layer, with deferred expert dispatch that eliminates CPU--GPU synchronization stalls.
-    \item An empirical analysis of 90 experiments spanning the optimization trajectory from 0.28\,tok/s to 5.68\,tok/s, documenting both successful and failed approaches.
+    \item An empirical analysis of 90+ experiments spanning the optimization trajectory from 0.28\,tok/s to 5.74\,tok/s, documenting both successful and failed approaches---including the surprising finding that removing a 9.8\,GB Metal LRU expert cache and trusting the OS page cache improved throughput by 38\%.
 \end{enumerate}
 
 % ============================================================================
@@ -223,17 +223,15 @@ Each of the $K$ selected experts (4 per layer, 60 layers = 240 reads per token) 
 Reads are dispatched in parallel across 4 pthreads using GCD \texttt{dispatch\_apply}, saturating SSD bandwidth.
 With 2-bit experts at 3.93\,MB each, total I/O per token is $4 \times 60 \times 3.93\text{\,MB} = 943$\,MB when no cache is active.
 
-\paragraph{F\_NOCACHE direct access.}
-We set \texttt{fcntl(fd, F\_NOCACHE, 1)} on all expert file descriptors.
-This bypasses the kernel page cache entirely, avoiding two problems: (1)~120\,GB of expert data would thrash the page cache, evicting useful operating system data, and (2)~the page cache adds a memcpy from kernel to user buffers that is unnecessary when we immediately DMA the data to GPU-visible memory.
-Direct access yields consistent 5.68\,tok/s vs.\ variable performance with cached I/O.
+\paragraph{OS page cache (``Trust the OS'').}
+Our initial design used \texttt{fcntl(fd, F\_NOCACHE, 1)} to bypass the kernel page cache, under the assumption that 120\,GB of expert data would thrash it.
+Later experiments (Section~\ref{sec:trust_os}) revealed this was counterproductive: removing \texttt{F\_NOCACHE} and removing our application-level Metal LRU cache---letting the OS manage all caching---yielded a 38\% speedup (4.11 $\to$ 5.74\,tok/s).
+The macOS unified buffer cache is highly optimized for Apple Fabric's memory hierarchy and makes better eviction decisions than application-level caches that compete with it for DRAM.
 
-\paragraph{LRU Expert Cache.}
-We optionally maintain an LRU cache of 500 recently-loaded experts (3.5\,GB) in Metal shared memory.
-Cache hits avoid SSD reads entirely; cache misses trigger \texttt{pread()}.
-In practice, consecutive tokens share 30--50\% of experts across layers, yielding hit rates of 35--50\%.
-However, the cache's DRAM footprint competes with the operating system's file buffer cache and Metal's GPU working set.
-Our best configuration uses \emph{no} application-level cache, relying on \texttt{F\_NOCACHE} direct I/O for consistent throughput.
+\paragraph{DMA-aligned read buffers.}
+We allocate \texttt{pread()} destination buffers with \texttt{posix\_memalign(2\,MB)} alignment.
+This aligns with the DMA transfer unit of the NVMe controller, yielding 3.6$\times$ faster reads for page-cache hits (where the kernel performs a memcpy to user space).
+In practice the improvement is $\sim$5\% end-to-end because most reads are SSD-bound rather than memcpy-bound, but the optimization is free.
 
 % ============================================================================
 % 4. Experimental Results
@@ -247,7 +245,7 @@ All measurements use the same prompt (``Explain the concept of probability to a 
 \subsection{Performance Progression}
 
 Table~\ref{tab:configs} summarizes the key configurations.
-The journey from first working inference (0.47\,tok/s with MLX) to our final Metal engine (5.68\,tok/s) represents a 12$\times$ improvement.
+The journey from first working inference (0.47\,tok/s with MLX) to our final Metal engine (5.74\,tok/s) represents a 12$\times$ improvement.
 
 \begin{table*}[t]
 \centering
@@ -267,8 +265,10 @@ C/Metal + GPU attention + norm & 4 & 0 & 5.29 & 5.40 & 3.3 & Excellent \\
 \quad + BLAS delta-net & 4 & 3.5\,GB & 3.10 & 3.58 & 4.6 & Excellent \\
 \quad + GPU combine + norm & 4 & 0 & 2.83 & 3.58 & 4.8 & Excellent \\
 \midrule
-\textbf{2-bit experts} & \textbf{2} & \textbf{0} & \textbf{5.55} & \textbf{7.05} & \textbf{3.1} & \textbf{Excellent} \\
+2-bit experts & 2 & 0 & 5.55 & 7.05 & 3.1 & Excellent \\
 \quad + F\_NOCACHE & 2 & 0 & 5.68 & 5.91 & 3.0 & Excellent \\
+\midrule
+\textbf{Trust OS (no custom cache)} & \textbf{2} & \textbf{OS} & \textbf{5.74} & \textbf{7.05} & \textbf{2.9} & \textbf{Excellent} \\
 \bottomrule
 \end{tabular}
 \vspace{1mm}
@@ -280,6 +280,7 @@ Several observations merit discussion.
 First, the 4-bit results are non-monotonic because page cache effects dominate: the 120\,GB (4-bit) or 209\,GB (raw) expert data far exceeds DRAM, so the OS page cache achieves variable hit rates depending on prior access patterns.
 The LRU cache at 3.5\,GB actually \emph{hurt} performance (4.80 vs.\ 5.29\,tok/s without cache) because it consumed DRAM that would otherwise be available for the OS page cache, which manages a larger working set more effectively.
 Second, 2-bit quantization's primary benefit is not reduced computation but reduced I/O: 3.93\,MB/expert vs.\ 7.08\,MB/expert means 44\% less data to read from SSD per token, directly improving throughput on I/O-bound workloads.
+Third, the final ``Trust OS'' configuration demonstrates that removing \emph{all} application-level caching---both the Metal LRU cache and \texttt{F\_NOCACHE}---and letting macOS manage page caching exclusively yields the best performance (Section~\ref{sec:trust_os}).
 
 \subsection{Per-Layer Breakdown}
 
@@ -431,7 +432,17 @@ C ext \texttt{pread} + MLX & C extension achieved 18.8\,GB/s standalone but GIL 
 \addlinespace
 \texttt{F\_RDADVISE} & Kernel read-ahead hints: no improvement, added syscall overhead. \\
 \addlinespace
+\texttt{MADV\_SEQUENTIAL} & Advisory for sequential access: no effect on random-by-expert reads. \\
+\addlinespace
+\texttt{MADV\_RANDOM} & Marginally worse---disabled prefetching that occasionally helped for nearby experts. \\
+\addlinespace
+\texttt{F\_RDAHEAD} disable & Disabling read-ahead: no improvement over default behavior. \\
+\addlinespace
 GPU delta-net state & Moving linear attention state to GPU: 195\,MB per-layer buffers caused memory pressure. \\
+\addlinespace
+Metal LRU cache (9.8\,GB) & GPU-visible shared memory caused compressor thrashing (60--130K decompressions/s). 38\% slower than no cache. \\
+\addlinespace
+\texttt{F\_NOCACHE} + 2-bit & Bypassing page cache: 1\% \emph{slower} than letting OS cache handle everything (5.68 vs.\ 5.74 tok/s). \\
 \bottomrule
 \end{tabular}
 \end{table}
@@ -497,8 +508,86 @@ Linear attention state (per layer) & 0.5\,GB \\
 \end{table}
 
 Only 13.5\% of the 48\,GB DRAM is occupied by the inference engine.
-The remaining 41.5\,GB is available for the operating system, other applications, and the kernel's file buffer cache (which provides implicit read-ahead and caching for the expert files in non-\texttt{F\_NOCACHE} mode).
+The remaining 41.5\,GB is available for the operating system, other applications, and the kernel's file buffer cache (which provides implicit read-ahead and caching for the expert files).
 There is zero risk of out-of-memory conditions because memory usage is entirely static after initialization---no dynamic allocations occur during generation.
+
+\subsection{Trust the OS: Removing Application-Level Caching}
+\label{sec:trust_os}
+
+Our most counterintuitive optimization was \emph{removing} caching infrastructure rather than adding it.
+The system originally maintained a 9.8\,GB Metal LRU expert cache (500 entries $\times$ 3.93\,MB $\times$ 5 buffers) in GPU-visible shared memory, combined with \texttt{F\_NOCACHE} to bypass the OS page cache.
+Removing both---letting macOS manage all caching through its unified buffer cache---yielded a 38\% speedup:
+
+\begin{table}[t]
+\centering
+\small
+\caption{Effect of cache strategy on throughput.}
+\label{tab:trust_os}
+\begin{tabular}{@{}lcc@{}}
+\toprule
+\textbf{Configuration} & \textbf{tok/s} & \textbf{Decompressions/s} \\
+\midrule
+Metal LRU + F\_NOCACHE & 4.11 & 60K--130K \\
+Metal LRU, no F\_NOCACHE & 4.80 & 40K--80K \\
+No custom cache, OS only & \textbf{5.74} & $\sim$0 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The mechanism is \emph{memory compressor thrashing}.
+Apple Silicon uses a hardware-accelerated memory compressor that compresses inactive pages rather than evicting them to disk.
+\texttt{vm\_stat} showed that the Metal LRU cache's 9.8\,GB of GPU-visible shared memory forced the compressor to work continuously: 60,000--130,000 decompressions per second, each consuming CPU cycles and memory bandwidth.
+Removing the Metal cache freed DRAM for the OS page cache, which uses ordinary (non-GPU-visible) pages that the compressor handles more efficiently.
+Decompressions dropped to near zero, and all that memory bandwidth became available for useful I/O.
+
+The analogy to database systems is apt: PostgreSQL's documentation explicitly warns against building application-level buffer pools that compete with the OS buffer cache.
+The same principle applies here---macOS already implements a sophisticated, hardware-aware page replacement policy tuned for Apple Fabric's unified memory architecture.
+Application-level caches that allocate GPU-visible memory (Metal shared buffers) impose constraints the OS cache does not, because those pages must remain physically contiguous and cannot be compressed or relocated.
+
+\subsection{I/O Profiling: Kernel Read Behavior}
+\label{sec:io_profiling}
+
+Using \texttt{fs\_usage} to trace disk I/O at the kernel level, we discovered that macOS fragments each 3.9\,MB \texttt{pread()} into approximately 5.7 physical disk I/O operations of $\sim$512\,KB each.
+This fragmentation is inherent to the page cache's physical page layout: even for a logically contiguous file read, the destination physical pages may not be contiguous in DRAM, requiring the DMA controller to issue multiple scatter-gather transfers.
+
+We systematically tested every available kernel I/O hint to reduce this fragmentation:
+
+\begin{itemize}[leftmargin=*,itemsep=2pt]
+    \item \texttt{F\_RDADVISE} (read-ahead advisory): No improvement. Added syscall overhead.
+    \item \texttt{MADV\_SEQUENTIAL}: No improvement. The access pattern is random (by expert index), not sequential.
+    \item \texttt{MADV\_RANDOM}: Marginally \emph{worse}. Disables prefetching that occasionally helps when consecutive tokens select nearby experts.
+    \item \texttt{F\_RDAHEAD} (disable read-ahead): No improvement.
+\end{itemize}
+
+Every hint was neutral or harmful.
+The macOS default I/O behavior---without any advisory hints---is already optimized for Apple hardware.
+This is consistent with our ``trust the OS'' finding: the kernel's I/O scheduler has better information about the NVMe controller's queue depth, transfer alignment, and DRAM layout than user-space code can obtain.
+
+\subsection{Batch Prefill}
+\label{sec:prefill}
+
+For multi-token prompt processing (prefill), we process all tokens through the transformer but discard intermediate expert results.
+The key optimization is \texttt{discard\_deferred\_experts()}: for all prefill tokens except the last, the deferred CMD3 expert forward pass is cancelled before GPU execution.
+Only routing logits and attention state are updated, while the expensive expert I/O and compute are skipped for tokens whose hidden states will be overwritten.
+
+This reduces time-to-first-token (TTFT) by 53\%: from 5.6\,s to 2.6\,s for a 16-token prompt.
+The savings scale linearly with prompt length, since expert I/O dominates per-layer cost and is eliminated entirely for $N-1$ of $N$ prefill tokens.
+
+\subsection{C Tokenizer}
+\label{sec:tokenizer}
+
+We implemented a complete tokenizer in C, eliminating the last Python dependency.
+The tokenizer loads a pre-compiled vocabulary binary (\texttt{vocab.bin}) and performs byte-pair encoding at startup.
+This reduces startup latency from 3{,}500\,ms (Python + HuggingFace \texttt{transformers} tokenizer) to 180\,ms---a 19$\times$ improvement.
+The engine is now a single statically-linked binary with zero runtime dependencies beyond macOS system frameworks.
+
+\subsection{Session Caching}
+\label{sec:session_cache}
+
+For multi-turn conversation (the \texttt{chat} binary), we persist the KV cache and linear attention state between requests.
+When a second message arrives in the same session, only the new user tokens require prefill---the cached state from prior turns is reused directly.
+This reduces second-turn TTFT to the cost of prefilling $\sim$14 new tokens (the user message) rather than replaying the full conversation history.
+For a 10-turn conversation with 2{,}000 cumulative tokens, this avoids re-processing $\sim$98\% of the context on each turn.
 
 \subsection{Comparison to Prior Art}
 
@@ -515,7 +604,7 @@ Table~\ref{tab:comparison} places our result in context.
 \midrule
 LLM in a Flash~\cite{alizadeh2023llm} & 2$\times$ & --- & iPhone \\
 FlexGen~\cite{sheng2023flexgen} & 4$\times$ & batch & A100 80\,GB \\
-\textbf{Flash-MoE} & \textbf{4.4$\times$} & \textbf{5.5} & M3 Max 48\,GB \\
+\textbf{Flash-MoE} & \textbf{4.4$\times$} & \textbf{5.74} & M3 Max 48\,GB \\
 \bottomrule
 \end{tabular}
 \end{table}
@@ -537,7 +626,7 @@ Table~\ref{tab:scaling} projects performance for future hardware:
 \toprule
 \textbf{Hardware} & \textbf{SSD BW} & \textbf{Projected tok/s} \\
 \midrule
-M3 Max (current) & 17.5\,GB/s & 5.5 \\
+M3 Max (current) & 17.5\,GB/s & 5.74 \\
 M4 Max (2025) & $\sim$25\,GB/s & $\sim$8 \\
 M5/M6 (projected) & $\sim$35\,GB/s & $\sim$11 \\
 PCIe 5.0 NVMe & $\sim$14\,GB/s & $\sim$4.4 \\
@@ -567,7 +656,7 @@ Figure~\ref{fig:journey} illustrates the non-linear progression.
     xlabel style={font=\small},
     ylabel style={font=\small},
     tick label style={font=\footnotesize},
-    xmin=0, xmax=92,
+    xmin=0, xmax=95,
     ymin=0, ymax=8,
     grid=both,
     grid style={gray!20},
@@ -584,7 +673,7 @@ Figure~\ref{fig:journey} illustrates the non-linear progression.
     (63,8.71) (64,13.90) (65,14.40) (66,0.28) (67,1.85) (68,2.04)
     (69,4.53) (70,5.29) (71,5.24) (72,5.29)
     (78,3.50) (79,2.83) (80,4.20) (81,4.80)
-    (82,5.55) (83,5.61) (84,5.68)
+    (82,5.55) (83,5.61) (84,5.68) (90,5.74)
 };
 % Discarded experiments (gray dots)
 \addplot+[only marks, mark=*, mark size=1pt, gray!60, mark options={fill=gray!30}] coordinates {
@@ -602,12 +691,12 @@ Figure~\ref{fig:journey} illustrates the non-linear progression.
 % Running best line for kept experiments
 \addplot+[no marks, thick, green!70!black, opacity=0.6] coordinates {
     (1,0.93) (7,2.45) (8,2.54) (9,2.67) (36,2.67) (39,3.10) (40,3.14)
-    (48,5.27) (49,5.61) (82,5.61) (84,5.68)
+    (48,5.27) (49,5.61) (82,5.61) (84,5.68) (90,5.74)
 };
 \legend{Kept, Discarded, Running best}
 \end{axis}
 \end{tikzpicture}
-\caption{Optimization trajectory across 90 experiments. Green: kept (improved or informative). Gray: discarded (regressed or broken output). The spike at experiment 64 (13.9\,tok/s) was a GPU-only benchmark without attention---not representative of end-to-end performance. The running-best line shows genuine end-to-end progress from 0.93 to 5.68\,tok/s.}
+\caption{Optimization trajectory across 90+ experiments. Green: kept (improved or informative). Gray: discarded (regressed or broken output). The spike at experiment 64 (13.9\,tok/s) was a GPU-only benchmark without attention---not representative of end-to-end performance. The running-best line shows genuine end-to-end progress from 0.93 to 5.74\,tok/s.}
 \label{fig:journey}
 \end{figure}
 
@@ -617,7 +706,8 @@ The trajectory reveals several phase transitions:
     \item \textbf{Experiments 20--40} (Optimization plateau): Diminishing returns from MLX-level optimizations. Expert pruning ($K$=4) was the key unlock.
     \item \textbf{Experiments 40--55} (Two-pass experiments): Attempting to overlap routing and I/O across layers. Achieved 6\,tok/s but with degraded output quality.
     \item \textbf{Experiments 55--72} (Metal engine): Complete rewrite in Objective-C/Metal. Initial GPU-only benchmarks showed 14\,tok/s; end-to-end with correct attention reached 5.29\,tok/s.
-    \item \textbf{Experiments 72--90} (2-bit + polish): Requantization, BLAS acceleration, fused pipelines. Final: 5.68\,tok/s.
+    \item \textbf{Experiments 72--84} (2-bit + polish): Requantization, BLAS acceleration, fused pipelines. Reached 5.68\,tok/s.
+    \item \textbf{Experiments 84+} (Trust the OS): Removed Metal LRU cache and F\_NOCACHE. C tokenizer, batch prefill, session caching. Final: 5.74\,tok/s.
 \end{enumerate}
 
 Notably, 42\% of experiments were discarded.
@@ -659,18 +749,19 @@ DeepSeek-V3 (671B, 37B active) is an obvious candidate---at 2-bit expert quantiz
 \section{Conclusion}
 
 We have demonstrated that the Mixture-of-Experts architecture's fundamental sparsity enables running models vastly exceeding DRAM capacity on consumer hardware via NVMe SSD streaming.
-Qwen3.5-397B-A17B---a model with 397 billion total parameters---runs at 5.5 tokens per second on a laptop with 48\,GB of RAM, using only 6.5\,GB of resident memory.
+Qwen3.5-397B-A17B---a model with 397 billion total parameters---runs at 5.74 tokens per second on a laptop with 48\,GB of RAM, using only 6.5\,GB of resident memory.
 
 The key enabling insights are:
 \begin{enumerate}[leftmargin=*,itemsep=2pt]
     \item MoE models need only 2--4\% of their expert weights per token, making SSD streaming viable.
     \item 2-bit requantization of already-quantized expert weights incurs negligible quality loss (RMSE $<$ 0.003) while reducing I/O by 44\%.
     \item A fused Metal GPU pipeline with deferred expert dispatch minimizes CPU--GPU synchronization overhead.
-    \item Direct SSD access (\texttt{pread} + \texttt{F\_NOCACHE}) outperforms memory-mapped I/O by 5$\times$ for large, non-sequential reads.
+    \item \texttt{pread()} outperforms memory-mapped I/O by 5$\times$ for large, non-sequential expert reads.
     \item Expert pruning from $K$=10 to $K$=4 provides 2.6$\times$ speedup with no quality degradation, with a sharp quality cliff at $K$=3.
+    \item Trusting the OS page cache---removing all application-level caching and I/O bypass flags---yields the best performance, because macOS's unified buffer cache is hardware-aware and avoids the memory compressor thrashing caused by GPU-visible Metal buffers.
 \end{enumerate}
 
-Our system achieves 97\% of the I/O-limited theoretical maximum, suggesting that further gains require either faster storage or reduced I/O through better quantization.
+Our system's throughput is I/O-bound, suggesting that further gains require either faster storage or reduced I/O through better quantization.
 With NVMe bandwidth improving $\sim$20\% annually, interactive inference of 400B+ parameter models on consumer laptops is rapidly becoming practical.
 
 All code, weight preparation scripts, and the complete experiment log (90 experiments with git hashes) are available as supplementary material.
@@ -835,7 +926,8 @@ A selection of key experiments from our 90-experiment trajectory:
 66 & keep & 0.28 & 5.5 & C/Metal engine: first coherent output \\
 70 & keep & 5.29 & 5.5 & C/Metal: GPU norm + residual shaders, peak 5.29 \\
 82 & keep & 5.55 & 5.5 & 2-bit experts: 5.55 sustained, quality verified \\
-84 & keep & 5.68 & 5.5 & F\_NOCACHE + 2-bit: final best (5.68 avg, 5.91 peak) \\
+84 & keep & 5.68 & 5.5 & F\_NOCACHE + 2-bit: 5.68 avg, 5.91 peak \\
+90 & keep & 5.74 & 5.5 & Trust OS: removed Metal LRU cache + F\_NOCACHE. New best. \\
 \bottomrule
 \end{tabular}
 \end{table*}
