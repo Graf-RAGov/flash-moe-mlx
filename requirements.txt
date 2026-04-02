@@ -1,0 +1,13 @@
+# In mainland China, export HF_ENDPOINT=https://hf-mirror.com before running `hf download`.
+
+# Core setup and model tooling
+huggingface_hub>=1.0,<2
+numpy>=1.26,<3
+safetensors>=0.4,<1
+
+# Visualization helper used by progress.py
+pandas>=2.2,<3
+matplotlib>=3.8,<4
+
+# Optional heavy dependency, kept out of the default install:
+# torch  # needed only for metal_infer/train_predictor.py

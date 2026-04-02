@@ -3,7 +3,7 @@ progress.py — Visualize Flash-MoE experiment progress.
 Reads results.tsv, generates progress.png with distinct Q2 and Q4 tracks.
 
 Usage:
-    pip install pandas matplotlib
+    python -m pip install -r requirements.txt
     python progress.py
 """
 

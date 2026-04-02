@@ -6,40 +6,32 @@ A step-by-step guide to running Qwen3.5-397B-A17B (397 billion parameter MoE mod
 
 **End result:** ~5 tok/s interactive chat + OpenAI-compatible API server. Zero cloud dependency.
 
+If you'd rather automate the manual steps below, the repo also ships `./install.sh` with the same flow and an optional guarded cleanup step.
+
 ---
 
 ## Hardware Requirements
 
 - Apple Silicon Mac (M3 Max, M4 Pro, M4 Max, or better)
 - **Minimum 48GB unified memory** (64GB+ recommended for better page cache hit rates)
-- **~450GB free disk space during setup** (drops to ~215GB after cleanup)
+- **~430GB free disk space during setup** (drops to ~215GB after cleanup)
 - 1TB+ SSD (all Apple Silicon Macs qualify)
 - macOS 26.2+ (Darwin 25.2.0+)
 
 ### Disk Space Budget — Read This First
 
-This is the #1 thing that will bite you. The setup has three phases of disk usage:
+This is the #1 thing that will bite you. With `hf download --local-dir`, there is no giant Git LFS shadow copy, but you still need enough space for both the source safetensors and the repacked experts.
 
 | Phase | Cumulative Disk Used | Notes |
 |-------|---------------------|-------|
-| Download MLX 4-bit model | ~210 GB | Source safetensors files |
-| Git LFS cache (hidden) | ~420 GB | `.git/lfs/` holds a second copy |
-| After `git lfs fetch --all` cleanup | ~210 GB | Delete `.git/lfs/` to reclaim |
-| After `repack_experts.py` | ~420 GB | 210GB source + 209GB packed experts |
+| Download MLX 4-bit model | ~210 GB | Source safetensors files in `~/qwen35-397b-4bit` |
+| After `extract_weights.py` | ~216 GB | Adds `model_weights.bin` (~5.5 GB) |
+| After `repack_experts.py` | ~425 GB | 210GB source + 209GB packed experts + extracted weights |
 | After deleting source model | **~215 GB** | Final footprint |
 
-**You need ~450GB free to start.** Plan your cleanup steps. On a 1TB drive, this means you need most of your disk empty.
+**You need ~430GB free to complete the setup comfortably.** Plan your cleanup steps. On a 1TB drive, this still means most of your disk needs to be empty.
 
-**Critical cleanup commands** (safe to run at each stage):
-
-```bash
-# After git lfs checkout completes — reclaim the LFS cache copy
-rm -rf ~/qwen35-397b-4bit/.git/lfs/
-
-# After repack_experts.py completes and you've verified inference works
-# Move packed_experts out, then delete the source model
-# (see "Final Directory Layout" below)
-```
+**Important:** `hf download --local-dir` writes files directly into your target directory. The `.cache/huggingface/` folder created there is only resume/update metadata, not a second 210GB copy of the model.
 
 ---
 
@@ -57,29 +49,9 @@ xcode-select --install
 
 # Python 3
 python3 --version
-
-# Git LFS (required for downloading the model)
-git lfs --version
-# If not installed:
-brew install git-lfs
-git lfs install
 ```
 
-### Python Dependencies
-
-```bash
-pip3 install --user safetensors numpy
-```
-
-### A Note on huggingface-cli
-
-The official way to download HuggingFace models is via `huggingface-cli`. However, the pip install may fail to create the CLI binary depending on your Python installation (common with macOS system Python or `/usr/local/bin/python3`). The symptoms:
-
-- `pip3 install --user huggingface_hub` succeeds
-- `huggingface-cli` returns "command not found"
-- The package installs to `~/Library/Python/3.x/lib/` but no binary appears in `~/Library/Python/3.x/bin/`
-
-**Don't waste time debugging this.** Use `git lfs` instead — it works perfectly and is already installed via Homebrew.
+Python dependencies are installed from the repo's `requirements.txt` after cloning in Phase 1.
 
 ---
 
@@ -90,6 +62,26 @@ cd ~
 git clone https://github.com/danveloper/flash-moe.git
 cd flash-moe
 ```
+
+### Create the Python Environment
+
+All Python dependencies live in `requirements.txt`, including the `hf` CLI used for model download.
+
+```bash
+cd ~/flash-moe
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install --upgrade pip
+python -m pip install -r requirements.txt
+
+# Recommended in mainland China: use the Hugging Face mirror
+export HF_ENDPOINT=https://hf-mirror.com
+
+# Verify the CLI is available
+hf --version
+```
+
+If you open a new terminal later, run `source ~/flash-moe/.venv/bin/activate` again before using `hf` or the Python helper scripts.
 
 ---
 
@@ -115,34 +107,42 @@ ls -la infer chat
 
 ```bash
 cd ~
-git clone https://huggingface.co/mlx-community/Qwen3.5-397B-A17B-4bit qwen35-397b-4bit
+source ~/flash-moe/.venv/bin/activate
+export HF_ENDPOINT=https://hf-mirror.com
+hf download mlx-community/Qwen3.5-397B-A17B-4bit --local-dir ~/qwen35-397b-4bit
 ```
 
-This clones the repo metadata but may not pull all LFS files. The actual weight download happens via:
+`hf download --local-dir` writes the model directly into `~/qwen35-397b-4bit` and keeps only a small `.cache/huggingface/` metadata directory there for resume/update tracking. It does **not** create a second Git LFS checkout.
 
-```bash
-cd ~/qwen35-397b-4bit
-git lfs fetch --all
-git lfs checkout
-```
-
-**Download speed:** ~50-60 MB/s typical. Expect 60-90 minutes for the full download.
+**Download speed:** Depends heavily on your network and mirror. The good news is that `hf download` is resumable — if the connection drops, just run the same command again.
 
 ### Common Download Issues
 
-**`git lfs pull` exits silently without downloading:**
-This happens when LFS thinks the files are already present (they're actually pointer stubs). Use `git lfs fetch --all` followed by `git lfs checkout` instead.
-
-**How to check for incomplete downloads (LFS pointer stubs):**
+**`hf: command not found`:**
+You are probably in a new shell. Re-activate the repo venv:
 
 ```bash
-# This checks the first bytes of each file — LFS stubs start with "version"
-for f in *.safetensors; do
-  head -c 7 "$f" | grep -q 'version' && echo "STUB: $f"
-done
+source ~/flash-moe/.venv/bin/activate
+hf --version
 ```
 
-If any files show as STUB, re-run `git lfs fetch --all && git lfs checkout`.
+**Download interrupted or partially completed:**
+Re-run the exact same command. `hf download --local-dir` will only fetch missing or stale files.
+
+```bash
+cd ~
+source ~/flash-moe/.venv/bin/activate
+export HF_ENDPOINT=https://hf-mirror.com
+hf download mlx-community/Qwen3.5-397B-A17B-4bit --local-dir ~/qwen35-397b-4bit
+```
+
+**How to check that all weight shards are present:**
+
+```bash
+cd ~/qwen35-397b-4bit
+ls model-*.safetensors | wc -l
+# Should print 46
+```
 
 **How to verify file integrity:**
 
@@ -155,17 +155,11 @@ If any file (except model-00046-of-00046) is significantly smaller than ~4.6 GB,
 
 ```bash
 rm model-000XX-of-00046.safetensors
-curl -L -o model-000XX-of-00046.safetensors \
-  "https://huggingface.co/mlx-community/Qwen3.5-397B-A17B-4bit/resolve/main/model-000XX-of-00046.safetensors"
+source ~/flash-moe/.venv/bin/activate
+export HF_ENDPOINT=https://hf-mirror.com
+hf download mlx-community/Qwen3.5-397B-A17B-4bit model-000XX-of-00046.safetensors \
+  --local-dir ~/qwen35-397b-4bit
 ```
-
-**After download completes — free up the LFS cache immediately:**
-
-```bash
-rm -rf ~/qwen35-397b-4bit/.git/lfs/
-```
-
-This reclaims ~210GB. The checked-out safetensors files are separate and unaffected.
 
 ---
 
@@ -177,7 +171,7 @@ The repo does not ship `vocab.bin` or `tokenizer.bin`. You must generate them fr
 
 ```bash
 cd ~/flash-moe/metal_infer
-python3 export_tokenizer.py ~/qwen35-397b-4bit/tokenizer.json
+python export_tokenizer.py ~/qwen35-397b-4bit/tokenizer.json
 ```
 
 Expected output: `tokenizer.bin` (~7.8 MB, 248044 vocab, 247587 merges)
@@ -190,7 +184,7 @@ Expected output: `tokenizer.bin` (~7.8 MB, 248044 vocab, 247587 merges)
 
 ```bash
 cd ~/flash-moe/metal_infer
-python3 export_vocab.py --model ~/qwen35-397b-4bit
+python export_vocab.py --model ~/qwen35-397b-4bit
 ```
 
 This reads `~/qwen35-397b-4bit/tokenizer.json` and writes `vocab.bin` in the current directory.
@@ -217,7 +211,7 @@ Your vocab.bin was built without byte-level BPE decoding. Re-run the script abov
 
 ```bash
 cd ~/flash-moe/metal_infer
-python3 extract_weights.py --model ~/qwen35-397b-4bit
+python extract_weights.py --model ~/qwen35-397b-4bit
 ```
 
 This creates:
@@ -226,7 +220,7 @@ This creates:
 
 Takes ~4 seconds.
 
-**If this fails with `MemoryError` or `FileNotFoundError`:** Your safetensors files are incomplete. Re-check for LFS stubs (see Phase 3).
+**If this fails with `MemoryError` or `FileNotFoundError`:** Your safetensors files are incomplete or missing. Re-check the shard count and file sizes from Phase 3, then re-run `hf download`.
 
 ---
 
@@ -241,7 +235,7 @@ df -h /
 
 ```bash
 cd ~/flash-moe/metal_infer
-python3 ../repack_experts.py --model ~/qwen35-397b-4bit
+python ../repack_experts.py --model ~/qwen35-397b-4bit
 ```
 
 This reads all 46 safetensors files and creates `packed_experts/` containing per-layer binary files optimized for the SSD streaming engine.
@@ -371,11 +365,11 @@ ln -s packed_experts_data packed_experts
 |---------|-------|-----|
 | All output is `!!!!` | 0/60 experts loaded OR NaN weights | Check packed_experts symlink; re-run extract_weights |
 | `hidden rms = nan` | Corrupted model_weights.bin | Delete and re-run extract_weights.py |
-| `MemoryError` in extract_weights | Safetensors files are LFS stubs | Run `git lfs fetch --all && git lfs checkout` |
-| `OSError: Short read` in repack | Truncated safetensors file | Check file sizes, re-download the small one |
+| `MemoryError` in extract_weights | Safetensors files are incomplete or missing | Re-run `hf download`, then re-check shard count and file sizes |
+| `OSError: Short read` in repack | Truncated safetensors file | Check file sizes, delete the bad shard, and re-run `hf download` for that file |
 | `Ġ` and `Ċ` in output | vocab.bin missing byte-level BPE decode | Rebuild vocab.bin with the BPE decode script |
 | `<unk>` at start of responses | Thinking tokens not in vocab | Cosmetic only; model output is correct |
-| `huggingface-cli: command not found` | pip entry point not created | Skip it, use `git lfs` instead |
-| `git lfs pull` exits silently | LFS thinks files are present | Use `git lfs fetch --all` then `git lfs checkout` |
+| `hf: command not found` | `.venv` not activated or requirements not installed | `source ~/flash-moe/.venv/bin/activate` then `python -m pip install -r requirements.txt` |
+| `hf download` stops midway | Network or mirror interruption | Re-run the same `hf download --local-dir ...` command; it resumes |
 | Chat says "Server not running" | infer --serve not started | Start `./infer --model PATH --serve 8000` first |
 | `./chat --model` unrecognized | chat doesn't take --model | Chat connects to the server; configure model on infer |
