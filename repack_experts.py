@@ -11,11 +11,11 @@ Within each expert block, 9 components packed in fixed order:
   down_proj.weight,  down_proj.scales,  down_proj.biases
 
 Usage:
-    python repack_experts.py                    # repack all 60 layers
-    python repack_experts.py --layers 0-4       # repack layers 0-4
-    python repack_experts.py --layers 0,5,10    # repack specific layers
-    python repack_experts.py --dry-run           # verify without writing
-    python repack_experts.py --verify-only 0     # verify layer 0 against originals
+    python repack_experts.py --model ~/qwen35-397b-4bit
+    python repack_experts.py --model ~/qwen35-397b-4bit --layers 0-4
+    python repack_experts.py --model ~/qwen35-397b-4bit --layers 0,5,10
+    python repack_experts.py --model ~/qwen35-397b-4bit --dry-run
+    python repack_experts.py --model ~/qwen35-397b-4bit --verify-only 0
 """
 
 import argparse
@@ -59,10 +59,10 @@ def parse_layers(spec):
 
 
 def load_index(index_path):
-    """Load expert_index.json and return expert_reads dict + model_path."""
+    """Load expert_index.json and return expert_reads dict."""
     with open(index_path) as f:
         idx = json.load(f)
-    return idx['expert_reads'], idx['model_path']
+    return idx['expert_reads']
 
 
 def verify_component_sizes(expert_reads):
@@ -100,7 +100,7 @@ def open_source_files(expert_reads, model_path, layers):
     return fds
 
 
-def repack_layer(layer_idx, expert_reads, model_path, fds, output_dir, dry_run=False):
+def repack_layer(layer_idx, expert_reads, fds, output_dir, dry_run=False):
     """Repack all 512 experts for one layer into a contiguous binary file.
 
     Returns (bytes_written, elapsed_seconds).
@@ -160,7 +160,7 @@ def repack_layer(layer_idx, expert_reads, model_path, fds, output_dir, dry_run=F
     return bytes_written, elapsed
 
 
-def verify_layer(layer_idx, expert_reads, model_path, fds, output_dir):
+def verify_layer(layer_idx, expert_reads, fds, output_dir):
     """Read back expert 0 from packed file and compare to originals."""
     layer_key = str(layer_idx)
     layer_info = expert_reads[layer_key]
@@ -213,7 +213,10 @@ def write_layout(output_dir):
 
 def main():
     parser = argparse.ArgumentParser(description="Repack expert weights into contiguous per-layer binary files")
-    parser.add_argument('--index', default='/Users/danielwoods/Workspace/ane-research/expert_index.json',
+    default_index = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'expert_index.json')
+    parser.add_argument('--model', required=True,
+                        help='Path to model directory containing safetensors shards')
+    parser.add_argument('--index', default=default_index,
                         help='Path to expert_index.json')
     parser.add_argument('--layers', default=None,
                         help='Layer spec: "all", "0-4", "0,5,10" (default: all)')
@@ -223,8 +226,19 @@ def main():
                         help='Verify a specific layer against originals')
     args = parser.parse_args()
 
+    model_path = os.path.abspath(os.path.expanduser(args.model))
+    index_path = os.path.abspath(os.path.expanduser(args.index))
+
+    if not os.path.isdir(model_path):
+        print(f"ERROR: model directory not found: {model_path}", file=sys.stderr)
+        sys.exit(1)
+    if not os.path.isfile(index_path):
+        print(f"ERROR: expert index not found: {index_path}", file=sys.stderr)
+        sys.exit(1)
+
     print("Loading expert index...")
-    expert_reads, model_path = load_index(args.index)
+    expert_reads = load_index(index_path)
+    print(f"Index path: {index_path}")
     print(f"Model path: {model_path}")
     print(f"Layers in index: {len(expert_reads)}")
 
@@ -264,7 +278,7 @@ def main():
     fds = open_source_files(expert_reads, model_path, layers)
 
     if args.verify_only is not None:
-        verify_layer(args.verify_only, expert_reads, model_path, fds, output_dir)
+        verify_layer(args.verify_only, expert_reads, fds, output_dir)
         for fd in fds.values():
             os.close(fd)
         return
@@ -279,7 +293,7 @@ def main():
     for i, layer_idx in enumerate(layers):
         t_layer = time.monotonic()
         bytes_written, elapsed = repack_layer(
-            layer_idx, expert_reads, model_path, fds, output_dir, dry_run=args.dry_run
+            layer_idx, expert_reads, fds, output_dir, dry_run=args.dry_run
         )
         total_written += bytes_written
 
@@ -295,7 +309,7 @@ def main():
                   f"ETA: {eta:.0f}s")
 
             # Verify this layer immediately
-            if not verify_layer(layer_idx, expert_reads, model_path, fds, output_dir):
+            if not verify_layer(layer_idx, expert_reads, fds, output_dir):
                 print(f"ABORTING: verification failed for layer {layer_idx}")
                 sys.exit(1)
 
