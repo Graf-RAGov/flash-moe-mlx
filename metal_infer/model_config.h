@@ -31,6 +31,7 @@
  */
 
 #define MODEL_NAME              "Qwen3-Coder-480B-A35B"
+#define MODEL_ID                "qwen3-coder-480b-a35b"
 
 /* Core dimensions */
 #define HIDDEN_DIM              6144
@@ -143,6 +144,7 @@
  */
 
 #define MODEL_NAME              "Qwen3.5-397B-A17B"
+#define MODEL_ID                "qwen3.5-397b-a17b"
 
 /* Core dimensions */
 #define HIDDEN_DIM              4096

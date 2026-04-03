@@ -6234,13 +6234,14 @@ static void serve_loop(
 
         // GET /health
         if (strcmp(method, "GET") == 0 && strcmp(path, "/health") == 0) {
-            const char *resp =
+            char resp[512];
+            snprintf(resp, sizeof(resp),
                 "HTTP/1.1 200 OK\r\n"
                 "Content-Type: application/json\r\n"
                 "Access-Control-Allow-Origin: *\r\n"
                 "Connection: close\r\n"
                 "\r\n"
-                "{\"status\":\"ok\",\"model\":\"qwen3.5-397b-a17b\"}\n";
+                "{\"status\":\"ok\",\"model\":\"%s\"}\n", MODEL_ID);
             http_write_str(client_fd, resp);
             free(reqbuf); close(client_fd);
             continue;
@@ -6248,14 +6249,15 @@ static void serve_loop(
 
         // GET /v1/models
         if (strcmp(method, "GET") == 0 && strcmp(path, "/v1/models") == 0) {
-            const char *resp =
+            char resp[512];
+            snprintf(resp, sizeof(resp),
                 "HTTP/1.1 200 OK\r\n"
                 "Content-Type: application/json\r\n"
                 "Access-Control-Allow-Origin: *\r\n"
                 "Connection: close\r\n"
                 "\r\n"
-                "{\"object\":\"list\",\"data\":[{\"id\":\"qwen3.5-397b-a17b\","
-                "\"object\":\"model\",\"owned_by\":\"local\"}]}\n";
+                "{\"object\":\"list\",\"data\":[{\"id\":\"%s\","
+                "\"object\":\"model\",\"owned_by\":\"local\"}]}\n", MODEL_ID);
             http_write_str(client_fd, resp);
             free(reqbuf); close(client_fd);
             continue;
@@ -6734,7 +6736,7 @@ int main(int argc, char **argv) {
             g_expert_cache = expert_cache_new(g_metal->device, cache_entries);
         }
 
-        printf("=== Qwen3.5-397B-A17B Metal Inference Engine ===\n");
+        printf("=== %s Metal Inference Engine ===\n", MODEL_NAME);
         printf("Model:    %s\n", model_path);
         printf("Weights:  %s\n", weights_path);
         printf("Manifest: %s\n", manifest_path);
