@@ -152,7 +152,7 @@ done
 
 REPO_DIR="$(cd "$REPO_DIR" && pwd -P)"
 MODEL_DIR="${MODEL_DIR/#\~/$HOME}"
-VENV_DIR="$REPO_DIR/.venv"
+VENV_DIR="$REPO_DIR/flash-moe-env"
 METAL_DIR="$REPO_DIR/metal_infer"
 MODEL_REPO="mlx-community/Qwen3.5-397B-A17B-4bit"
 
