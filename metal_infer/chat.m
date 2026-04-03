@@ -23,6 +23,8 @@
 #include <dirent.h>
 #include "linenoise.h"
 
+#include "model_config.h"
+
 #define MAX_INPUT_LINE 4096
 #define MAX_RESPONSE (1024 * 1024)
 #define SESSIONS_DIR_BASE ".flash-moe/sessions"
@@ -536,7 +538,7 @@ int main(int argc, char **argv) {
     }
 
     printf("==================================================\n");
-    printf("  Qwen3.5-397B-A17B Chat (Flash-MoE)\n");
+    printf("  %s Chat (Flash-MoE)\n", MODEL_NAME);
     printf("==================================================\n");
     printf("  Server:  http://localhost:%d\n", port);
     printf("  Session: %s%s\n", session_id, resume_id ? " (resumed)" : "");

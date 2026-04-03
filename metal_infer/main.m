@@ -42,43 +42,25 @@
 #include <errno.h>
 
 // ============================================================================
-// Constants matching the Qwen3.5-397B packed expert layout
+// Constants from model_config.h
 // ============================================================================
 
-#define HIDDEN_DIM       4096
-#define INTERMEDIATE_DIM 1024
-#define GROUP_SIZE       64
-#define BITS             4
-#define NUM_EXPERTS      512
-#define NUM_LAYERS       60
+#include "model_config.h"
+
+#define INTERMEDIATE_DIM MOE_INTERMEDIATE
 #define MAX_ACTIVE_EXPERTS 64
 
-// Expert component sizes (from layout.json)
-#define GATE_W_OFFSET    0
-#define GATE_W_SIZE      2097152   // [1024, 512] uint32
-#define GATE_S_OFFSET    2097152
-#define GATE_S_SIZE      131072    // [1024, 64] uint16 (bf16)
-#define GATE_B_OFFSET    2228224
-#define GATE_B_SIZE      131072
-
-#define UP_W_OFFSET      2359296
-#define UP_W_SIZE        2097152
-#define UP_S_OFFSET      4456448
-#define UP_S_SIZE        131072
-#define UP_B_OFFSET      4587520
-#define UP_B_SIZE        131072
-
-#define DOWN_W_OFFSET    4718592
-#define DOWN_W_SIZE      2097152   // [4096, 128] uint32
-#define DOWN_S_OFFSET    6815744
-#define DOWN_S_SIZE      131072    // [4096, 16] uint16 (bf16)
-#define DOWN_B_OFFSET    6946816
-#define DOWN_B_SIZE      131072
-
-#define EXPERT_SIZE      7077888   // Total bytes per expert
-
-// Default model path
-#define MODEL_PATH "/Users/danielwoods/.cache/huggingface/hub/models--mlx-community--Qwen3.5-397B-A17B-4bit/snapshots/39159bd8aa74f5c8446d2b2dc584f62bb51cb0d3"
+/* Alias offset names for main.m compatibility */
+#define GATE_W_OFFSET   GATE_W_OFF
+#define GATE_S_OFFSET   GATE_S_OFF
+#define GATE_B_OFFSET   GATE_B_OFF
+#define UP_W_OFFSET     UP_W_OFF
+#define UP_S_OFFSET     UP_S_OFF
+#define UP_B_OFFSET     UP_B_OFF
+#define DOWN_W_OFFSET   DOWN_W_OFF
+#define DOWN_S_OFFSET   DOWN_S_OFF
+#define DOWN_B_OFFSET   DOWN_B_OFF
+#define MODEL_PATH      MODEL_PATH_DEFAULT
 
 // ============================================================================
 // Timing helper

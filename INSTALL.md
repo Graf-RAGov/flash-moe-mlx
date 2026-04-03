@@ -8,6 +8,8 @@ A step-by-step guide to running Qwen3.5-397B-A17B (397 billion parameter MoE mod
 
 If you'd rather automate the manual steps below, the repo also ships `./install.sh` with the same flow and an optional guarded cleanup step.
 
+**Important:** `./install.sh` only supports `mlx-community/Qwen3.5-397B-A17B-4bit`. `--model-dir` changes the location, not the model family.
+
 ---
 
 ## Hardware Requirements

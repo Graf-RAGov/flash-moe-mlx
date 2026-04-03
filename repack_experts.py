@@ -2,8 +2,7 @@
 """Repack expert weights from scattered safetensors into contiguous per-layer binary files.
 
 Creates one binary file per layer: packed_experts/layer_XX.bin
-Each file = 512 experts x 7,077,888 bytes = ~3.63 GB
-Expert E starts at byte offset E * 7,077,888
+Each file = N_EXPERTS x EXPERT_SIZE bytes
 
 Within each expert block, 9 components packed in fixed order:
   gate_proj.weight, gate_proj.scales, gate_proj.biases,
@@ -12,35 +11,123 @@ Within each expert block, 9 components packed in fixed order:
 
 Usage:
     python repack_experts.py --model ~/qwen35-397b-4bit
+    python repack_experts.py --model ~/qwen3-coder-480b-4bit --profile qwen3-coder
     python repack_experts.py --model ~/qwen35-397b-4bit --layers 0-4
-    python repack_experts.py --model ~/qwen35-397b-4bit --layers 0,5,10
     python repack_experts.py --model ~/qwen35-397b-4bit --dry-run
     python repack_experts.py --model ~/qwen35-397b-4bit --verify-only 0
+    python repack_experts.py --model ~/qwen35-397b-4bit --validate-model
 """
 
 import argparse
 import json
 import os
+import re
+import struct
 import time
 import sys
 
-# Component order and expected sizes
-COMPONENTS = [
-    {"name": "gate_proj.weight",  "offset": 0,       "size": 2097152, "dtype": "U32", "shape": [1024, 512]},
-    {"name": "gate_proj.scales",  "offset": 2097152,  "size": 131072,  "dtype": "BF16", "shape": [1024, 64]},
-    {"name": "gate_proj.biases",  "offset": 2228224,  "size": 131072,  "dtype": "BF16", "shape": [1024, 64]},
-    {"name": "up_proj.weight",    "offset": 2359296,  "size": 2097152, "dtype": "U32", "shape": [1024, 512]},
-    {"name": "up_proj.scales",    "offset": 4456448,  "size": 131072,  "dtype": "BF16", "shape": [1024, 64]},
-    {"name": "up_proj.biases",    "offset": 4587520,  "size": 131072,  "dtype": "BF16", "shape": [1024, 64]},
-    {"name": "down_proj.weight",  "offset": 4718592,  "size": 2097152, "dtype": "U32", "shape": [4096, 128]},
-    {"name": "down_proj.scales",  "offset": 6815744,  "size": 131072,  "dtype": "BF16", "shape": [4096, 16]},
-    {"name": "down_proj.biases",  "offset": 6946816,  "size": 131072,  "dtype": "BF16", "shape": [4096, 16]},
-]
+# ============================================================================
+# Model profiles
+# ============================================================================
 
-EXPERT_SIZE = 7077888   # bytes per expert
-NUM_EXPERTS = 512
-NUM_LAYERS = 60
-LAYER_SIZE = NUM_EXPERTS * EXPERT_SIZE  # 3,623,878,656 bytes (~3.63 GB)
+MODEL_PROFILES = {
+    "qwen35-397b": {
+        "components": [
+            {"name": "gate_proj.weight",  "offset": 0,       "size": 2097152, "dtype": "U32", "shape": [1024, 512]},
+            {"name": "gate_proj.scales",  "offset": 2097152,  "size": 131072,  "dtype": "BF16", "shape": [1024, 64]},
+            {"name": "gate_proj.biases",  "offset": 2228224,  "size": 131072,  "dtype": "BF16", "shape": [1024, 64]},
+            {"name": "up_proj.weight",    "offset": 2359296,  "size": 2097152, "dtype": "U32", "shape": [1024, 512]},
+            {"name": "up_proj.scales",    "offset": 4456448,  "size": 131072,  "dtype": "BF16", "shape": [1024, 64]},
+            {"name": "up_proj.biases",    "offset": 4587520,  "size": 131072,  "dtype": "BF16", "shape": [1024, 64]},
+            {"name": "down_proj.weight",  "offset": 4718592,  "size": 2097152, "dtype": "U32", "shape": [4096, 128]},
+            {"name": "down_proj.scales",  "offset": 6815744,  "size": 131072,  "dtype": "BF16", "shape": [4096, 16]},
+            {"name": "down_proj.biases",  "offset": 6946816,  "size": 131072,  "dtype": "BF16", "shape": [4096, 16]},
+        ],
+        "expert_size": 7077888,
+        "num_experts": 512,
+        "num_layers": 60,
+        "weight_prefix": "language_model.",
+        "supported_config": {
+            "hidden_size": 4096,
+            "num_hidden_layers": 60,
+            "num_experts": 512,
+            "num_experts_per_tok": 4,
+        },
+        "supported_shard_count": 46,
+        "supported_bits": 4,
+        # regex: group(1)=layer, group(2)=proj, group(3)=part (weight/scales/biases)
+        "expert_key_pattern": r"language_model\.model\.layers\.(\d+)\.mlp\.experts\.(\d+)\.(\w+)\.(weight|scales|biases)",
+        "expert_key_type": "individual",  # one tensor per expert
+    },
+    "qwen3-coder": {
+        "components": [
+            {"name": "gate_proj.weight",  "offset": 0,        "size": 7864320,  "dtype": "U32", "shape": [2560, 768]},
+            {"name": "gate_proj.scales",  "offset": 7864320,   "size": 491520,   "dtype": "BF16", "shape": [2560, 96]},
+            {"name": "gate_proj.biases",  "offset": 8355840,   "size": 491520,   "dtype": "BF16", "shape": [2560, 96]},
+            {"name": "up_proj.weight",    "offset": 8847360,   "size": 7864320,  "dtype": "U32", "shape": [2560, 768]},
+            {"name": "up_proj.scales",    "offset": 16711680,  "size": 491520,   "dtype": "BF16", "shape": [2560, 96]},
+            {"name": "up_proj.biases",    "offset": 17203200,  "size": 491520,   "dtype": "BF16", "shape": [2560, 96]},
+            {"name": "down_proj.weight",  "offset": 17694720,  "size": 7864320,  "dtype": "U32", "shape": [6144, 320]},
+            {"name": "down_proj.scales",  "offset": 25559040,  "size": 491520,   "dtype": "BF16", "shape": [6144, 40]},
+            {"name": "down_proj.biases",  "offset": 26050560,  "size": 491520,   "dtype": "BF16", "shape": [6144, 40]},
+        ],
+        "expert_size": 26542080,
+        "num_experts": 160,
+        "num_layers": 62,
+        "weight_prefix": "",
+        "supported_config": {
+            "hidden_size": 6144,
+            "num_hidden_layers": 62,
+            "num_experts": 160,
+            "num_experts_per_tok": 8,
+        },
+        "supported_shard_count": None,  # not validated
+        "supported_bits": 4,
+        # regex: group(1)=layer, group(2)=proj, group(3)=part (weight/scales/biases)
+        "expert_key_pattern": r"model\.layers\.(\d+)\.mlp\.switch_mlp\.(\w+)\.(weight|scales|biases)",
+        "expert_key_type": "packed",  # all experts in one tensor [N, ...]
+    },
+}
+
+# Default profile
+ACTIVE_PROFILE = None
+COMPONENTS = None
+EXPERT_SIZE = None
+NUM_EXPERTS = None
+NUM_LAYERS = None
+LAYER_SIZE = None
+WEIGHT_PREFIX = None
+SUPPORTED_MODEL_CONFIG = None
+SUPPORTED_SHARD_COUNT = None
+SUPPORTED_BITS = None
+EXPERT_KEY_PATTERN = None
+EXPERT_KEY_TYPE = None
+
+
+def set_profile(name):
+    """Set the active model profile."""
+    global ACTIVE_PROFILE, COMPONENTS, EXPERT_SIZE, NUM_EXPERTS, NUM_LAYERS
+    global LAYER_SIZE, WEIGHT_PREFIX, SUPPORTED_MODEL_CONFIG
+    global SUPPORTED_SHARD_COUNT, SUPPORTED_BITS
+    global EXPERT_KEY_PATTERN, EXPERT_KEY_TYPE
+
+    if name not in MODEL_PROFILES:
+        print(f"ERROR: unknown model profile '{name}'. Available: {', '.join(MODEL_PROFILES.keys())}", file=sys.stderr)
+        sys.exit(1)
+
+    p = MODEL_PROFILES[name]
+    ACTIVE_PROFILE = name
+    COMPONENTS = p["components"]
+    EXPERT_SIZE = p["expert_size"]
+    NUM_EXPERTS = p["num_experts"]
+    NUM_LAYERS = p["num_layers"]
+    LAYER_SIZE = NUM_EXPERTS * EXPERT_SIZE
+    WEIGHT_PREFIX = p["weight_prefix"]
+    SUPPORTED_MODEL_CONFIG = p["supported_config"]
+    SUPPORTED_SHARD_COUNT = p["supported_shard_count"]
+    SUPPORTED_BITS = p["supported_bits"]
+    EXPERT_KEY_PATTERN = p["expert_key_pattern"]
+    EXPERT_KEY_TYPE = p["expert_key_type"]
 
 
 def parse_layers(spec):
@@ -63,6 +150,217 @@ def load_index(index_path):
     with open(index_path) as f:
         idx = json.load(f)
     return idx['expert_reads']
+
+
+def generate_expert_index(model_path):
+    """Generate expert_reads from safetensors headers for packed-expert models.
+
+    For models like Qwen3-Coder where all experts are stored in a single tensor
+    per component per layer (shape [N_experts, ...]), we scan safetensors headers
+    to build the same index structure as pre-built expert_index.json.
+    """
+    index_path = os.path.join(model_path, "model.safetensors.index.json")
+    with open(index_path) as f:
+        weight_index = json.load(f)
+    weight_map = weight_index["weight_map"]
+
+    pattern = re.compile(EXPERT_KEY_PATTERN)
+    file_headers = {}
+    expert_reads = {}
+
+    if EXPERT_KEY_TYPE == "packed":
+        # Packed format: model.layers.X.mlp.switch_mlp.{proj}.{part}
+        # Each tensor has shape [N_experts, ...], all experts contiguous
+        for key in sorted(weight_map.keys()):
+            m = pattern.match(key)
+            if not m:
+                continue
+            layer_idx, proj_name, part_name = m.groups()
+            comp_name = f"{proj_name}.{part_name}"
+            shard_file = weight_map[key]
+
+            if layer_idx not in expert_reads:
+                expert_reads[layer_idx] = {}
+
+            if shard_file not in file_headers:
+                shard_path = os.path.join(model_path, shard_file)
+                with open(shard_path, "rb") as f:
+                    header_size = struct.unpack("<Q", f.read(8))[0]
+                    header = json.loads(f.read(header_size))
+                file_headers[shard_file] = (header, header_size)
+
+            header, h_size = file_headers[shard_file]
+            tensor_info = header[key]
+            shape = tensor_info["shape"]
+            data_start = tensor_info["data_offsets"][0] + 8 + h_size
+            data_end = tensor_info["data_offsets"][1] + 8 + h_size
+            total_size = data_end - data_start
+            num_experts = shape[0]
+            expert_size = total_size // num_experts
+
+            expert_reads[layer_idx][comp_name] = {
+                "file": shard_file,
+                "abs_offset": data_start,
+                "expert_stride": expert_size,
+                "expert_size": expert_size,
+                "total_size": total_size,
+                "shape": shape,
+            }
+    else:
+        # Individual format: each expert is a separate tensor
+        # Pattern captures layer, expert_idx, proj, part
+        for key in sorted(weight_map.keys()):
+            m = pattern.match(key)
+            if not m:
+                continue
+            layer_idx, expert_idx_str, proj_name, part_name = m.groups()
+            expert_idx = int(expert_idx_str)
+            comp_name = f"{proj_name}.{part_name}"
+            shard_file = weight_map[key]
+
+            if expert_idx != 0:
+                continue  # only need expert 0 to determine strides
+
+            if layer_idx not in expert_reads:
+                expert_reads[layer_idx] = {}
+
+            if shard_file not in file_headers:
+                shard_path = os.path.join(model_path, shard_file)
+                with open(shard_path, "rb") as f:
+                    header_size = struct.unpack("<Q", f.read(8))[0]
+                    header = json.loads(f.read(header_size))
+                file_headers[shard_file] = (header, header_size)
+
+            header, h_size = file_headers[shard_file]
+            tensor_info = header[key]
+            shape = tensor_info["shape"]
+            data_start = tensor_info["data_offsets"][0] + 8 + h_size
+            data_end = tensor_info["data_offsets"][1] + 8 + h_size
+            expert_size = data_end - data_start
+
+            expert_reads[layer_idx][comp_name] = {
+                "file": shard_file,
+                "abs_offset": data_start,
+                "expert_stride": expert_size,
+                "expert_size": expert_size,
+                "total_size": expert_size * NUM_EXPERTS,
+                "shape": [NUM_EXPERTS] + shape,
+            }
+
+    print(f"Generated expert index: {len(expert_reads)} layers, "
+          f"{len(next(iter(expert_reads.values())))} components/layer")
+    return expert_reads
+
+
+def load_model_metadata(model_path):
+    """Load config/index metadata for user-facing compatibility checks."""
+    config_path = os.path.join(model_path, "config.json")
+    index_path = os.path.join(model_path, "model.safetensors.index.json")
+
+    metadata = {
+        "config_path": config_path,
+        "index_path": index_path,
+        "config": {},
+        "weight_index": {},
+        "bits": None,
+        "group_size": None,
+        "hidden_size": None,
+        "num_hidden_layers": None,
+        "num_experts": None,
+        "num_experts_per_tok": None,
+        "shard_count": None,
+        "total_parameters": None,
+    }
+
+    if os.path.isfile(config_path):
+        with open(config_path) as f:
+            metadata["config"] = json.load(f)
+        quant = metadata["config"].get("quantization_config") or metadata["config"].get("quantization") or {}
+        metadata["bits"] = quant.get("bits")
+        metadata["group_size"] = quant.get("group_size")
+        for key in SUPPORTED_MODEL_CONFIG:
+            metadata[key] = metadata["config"].get(key)
+
+    if os.path.isfile(index_path):
+        with open(index_path) as f:
+            metadata["weight_index"] = json.load(f)
+        shard_files = sorted(set(metadata["weight_index"].get("weight_map", {}).values()))
+        metadata["shard_count"] = len(shard_files)
+        metadata["total_parameters"] = metadata["weight_index"].get("metadata", {}).get("total_parameters")
+
+    return metadata
+
+
+def validate_supported_model(model_path, expert_reads):
+    """Fail fast with a clear error when the model directory is incompatible."""
+    metadata = load_model_metadata(model_path)
+    problems = []
+
+    for key, expected in SUPPORTED_MODEL_CONFIG.items():
+        actual = metadata.get(key)
+        if actual != expected:
+            problems.append(f"{key}={actual!r} (expected {expected})")
+
+    if metadata["bits"] != SUPPORTED_BITS:
+        problems.append(f"quantization bits={metadata['bits']!r} (expected {SUPPORTED_BITS})")
+
+    if SUPPORTED_SHARD_COUNT is not None and metadata["shard_count"] != SUPPORTED_SHARD_COUNT:
+        problems.append(f"shard_count={metadata['shard_count']!r} (expected {SUPPORTED_SHARD_COUNT})")
+
+    missing_files = []
+    if expert_reads is not None:
+        expected_files = sorted({
+            info["file"]
+            for layer_info in expert_reads.values()
+            for info in layer_info.values()
+        })
+        missing_files = [
+            fname for fname in expected_files
+            if not os.path.isfile(os.path.join(model_path, fname))
+        ]
+        if missing_files:
+            problems.append(
+                f"missing {len(missing_files)} shard(s) referenced by expert_index.json"
+            )
+
+    if problems:
+        detected = [
+            f"hidden_size={metadata['hidden_size']!r}",
+            f"num_hidden_layers={metadata['num_hidden_layers']!r}",
+            f"num_experts={metadata['num_experts']!r}",
+            f"num_experts_per_tok={metadata['num_experts_per_tok']!r}",
+            f"bits={metadata['bits']!r}",
+            f"shards={metadata['shard_count']!r}",
+        ]
+        if metadata["total_parameters"] is not None:
+            detected.append(f"total_parameters={metadata['total_parameters']}")
+
+        print(f"ERROR: unsupported model directory: {model_path}", file=sys.stderr)
+        print(f"Active profile: {ACTIVE_PROFILE}", file=sys.stderr)
+        print(f"Detected metadata: {', '.join(detected)}", file=sys.stderr)
+        print("Compatibility check failed:", file=sys.stderr)
+        for problem in problems:
+            print(f"  - {problem}", file=sys.stderr)
+
+        if SUPPORTED_SHARD_COUNT is not None and metadata["shard_count"] not in (None, SUPPORTED_SHARD_COUNT):
+            print(
+                f"Hint: --model/--model-dir points at a different MLX model. "
+                f"Check that --profile matches your model.",
+                file=sys.stderr,
+            )
+        elif missing_files:
+            preview = ", ".join(missing_files[:3])
+            if len(missing_files) > 3:
+                preview += ", ..."
+            print(f"Missing files include: {preview}", file=sys.stderr)
+            print(
+                "Hint: the model download is incomplete. Re-run hf download to fetch the missing shards.",
+                file=sys.stderr,
+            )
+        return False
+
+    print(f"Model metadata verified (profile: {ACTIVE_PROFILE})")
+    return True
 
 
 def verify_component_sizes(expert_reads):
@@ -161,7 +459,7 @@ def repack_layer(layer_idx, expert_reads, fds, output_dir, dry_run=False):
 
 
 def verify_layer(layer_idx, expert_reads, fds, output_dir):
-    """Read back expert 0 from packed file and compare to originals."""
+    """Read back several experts from packed file and compare to originals."""
     layer_key = str(layer_idx)
     layer_info = expert_reads[layer_key]
     out_path = os.path.join(output_dir, f"layer_{layer_idx:02d}.bin")
@@ -172,8 +470,11 @@ def verify_layer(layer_idx, expert_reads, fds, output_dir):
 
     fd_packed = os.open(out_path, os.O_RDONLY)
 
+    # Spot-check: first, second, middle, last experts
+    check_indices = sorted(set([0, 1, NUM_EXPERTS // 2, NUM_EXPERTS - 1]))
+
     mismatches = 0
-    for expert_idx in [0, 1, 255, 511]:  # spot check several experts
+    for expert_idx in check_indices:
         for comp in COMPONENTS:
             info = layer_info[comp['name']]
             src_fd = fds[info['file']]
@@ -189,8 +490,9 @@ def verify_layer(layer_idx, expert_reads, fds, output_dir):
 
     os.close(fd_packed)
 
+    indices_str = ", ".join(str(i) for i in check_indices)
     if mismatches == 0:
-        print(f"  Layer {layer_idx}: verification PASSED (experts 0, 1, 255, 511)")
+        print(f"  Layer {layer_idx}: verification PASSED (experts {indices_str})")
     else:
         print(f"  Layer {layer_idx}: verification FAILED ({mismatches} mismatches)")
 
@@ -216,6 +518,9 @@ def main():
     default_index = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'expert_index.json')
     parser.add_argument('--model', required=True,
                         help='Path to model directory containing safetensors shards')
+    parser.add_argument('--profile', default='qwen35-397b',
+                        choices=list(MODEL_PROFILES.keys()),
+                        help='Model profile (default: qwen35-397b)')
     parser.add_argument('--index', default=default_index,
                         help='Path to expert_index.json')
     parser.add_argument('--layers', default=None,
@@ -224,7 +529,13 @@ def main():
                         help='Verify offsets without writing')
     parser.add_argument('--verify-only', type=int, default=None, metavar='LAYER',
                         help='Verify a specific layer against originals')
+    parser.add_argument('--validate-model', action='store_true',
+                        help='Check that --model matches the supported layout and exit')
     args = parser.parse_args()
+
+    set_profile(args.profile)
+    print(f"Model profile: {args.profile}")
+    print(f"Expert size: {EXPERT_SIZE:,} bytes, Experts/layer: {NUM_EXPERTS}, Layers: {NUM_LAYERS}")
 
     model_path = os.path.abspath(os.path.expanduser(args.model))
     index_path = os.path.abspath(os.path.expanduser(args.index))
@@ -232,19 +543,34 @@ def main():
     if not os.path.isdir(model_path):
         print(f"ERROR: model directory not found: {model_path}", file=sys.stderr)
         sys.exit(1)
-    if not os.path.isfile(index_path):
-        print(f"ERROR: expert index not found: {index_path}", file=sys.stderr)
-        sys.exit(1)
 
-    print("Loading expert index...")
-    expert_reads = load_index(index_path)
-    print(f"Index path: {index_path}")
+    # --validate-model: only check config.json metadata, no index needed
+    if args.validate_model:
+        if not validate_supported_model(model_path, expert_reads=None):
+            sys.exit(1)
+        return
+
+    # Load or generate expert index
+    use_auto_index = EXPERT_KEY_TYPE == "packed"
+    if use_auto_index:
+        print("Generating expert index from safetensors headers...")
+        expert_reads = generate_expert_index(model_path)
+    else:
+        if not os.path.isfile(index_path):
+            print(f"ERROR: expert index not found: {index_path}", file=sys.stderr)
+            sys.exit(1)
+        print("Loading expert index...")
+        expert_reads = load_index(index_path)
+        print(f"Index path: {index_path}")
     print(f"Model path: {model_path}")
     print(f"Layers in index: {len(expert_reads)}")
 
     # Verify component sizes
     if not verify_component_sizes(expert_reads):
         print("ABORTING: component size mismatch")
+        sys.exit(1)
+
+    if not validate_supported_model(model_path, expert_reads):
         sys.exit(1)
 
     output_dir = os.path.join(model_path, "packed_experts")
