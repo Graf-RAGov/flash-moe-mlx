@@ -51,7 +51,7 @@ MODEL_PROFILES = {
             "hidden_size": 4096,
             "num_hidden_layers": 60,
             "num_experts": 512,
-            "num_experts_per_tok": 4,
+            "num_experts_per_tok": 10,
         },
         "supported_shard_count": 46,
         "supported_bits": 4,
@@ -278,8 +278,10 @@ def load_model_metadata(model_path):
         quant = metadata["config"].get("quantization_config") or metadata["config"].get("quantization") or {}
         metadata["bits"] = quant.get("bits")
         metadata["group_size"] = quant.get("group_size")
+        # Multimodal models (e.g. Qwen3.5) nest text params under text_config
+        text_cfg = metadata["config"].get("text_config", {})
         for key in SUPPORTED_MODEL_CONFIG:
-            metadata[key] = metadata["config"].get(key)
+            metadata[key] = metadata["config"].get(key) or text_cfg.get(key)
 
     if os.path.isfile(index_path):
         with open(index_path) as f:
