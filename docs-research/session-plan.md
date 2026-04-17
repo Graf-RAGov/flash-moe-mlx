@@ -118,3 +118,21 @@ From `Qwen/Qwen3.6-35B-A3B/config.json` + `model.safetensors.index.json`:
 3. Exact fused-expert tensor shape: `[num_experts, 2*moe_inter, hidden]` vs `[num_experts, moe_inter, 2*hidden]` — slice direction matters.
 4. Whether nerds-odd-e's `model_config.h` already handles fused expert tensors (Qwen3-Coder-Next uses the same pattern) or only flat ones.
 5. Peak disk during repack — confirm incremental delete of source shards post-repack is safe.
+
+---
+
+## Post-port decisions (added in-session)
+
+### MTP speculative decoding — NOT worth implementing on this setup
+
+Researched (`docs-research/mtp-research.md`, `docs-research/opt-mtp-implementation.md`) and rejected. Reasons:
+
+1. **Weights not in our quant.** `mlx-community/Qwen3.6-35B-A3B-8bit` ships ZERO MTP tensors (`grep mtp model.safetensors.index.json` = 0 matches) — the quantizer dropped them. Getting them requires re-downloading bf16 shards 25+26 of the original repo (~6 GB more).
+
+2. **Prior art says break-even.** `CLAUDE.md` "Discarded" table: `MTP speculative decoding | break-even | MoE I/O scales per-token (unlike dense)`. Flash-moe's upstream team already tried it on 397B.
+
+3. **SSD-streamed MoE inverts the speedup math.** DeepSeek-V3's published 1.8× assumes weights-resident in GPU. On our setup, verifying γ draft tokens requires γ × K × 40 expert reads from SSD — I/O cost is 56 % of per-layer time, so extra reads eat the parallel-verify win.
+
+4. **Realistic gain here: +0-15 %, not 1.6-1.9×.** The target tok/s range (16-18 from 9.7) is not reachable via MTP while weights stream from SSD.
+
+**Revisit when:** the model fits fully in RAM (Q5 variant on this 32 GB box, or Q8 on a 48 GB+ host). Dense-case math applies there and the ~800-1000 LOC implementation becomes justified.
