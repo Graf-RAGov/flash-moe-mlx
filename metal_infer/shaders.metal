@@ -1256,7 +1256,7 @@ kernel void rms_norm_qk(
 kernel void compute_decay_beta(
     device const float *alpha_out,   // [num_v_heads] from projection
     device const float *beta_out,    // [num_v_heads] from projection
-    device const float *A_log,       // [num_v_heads] log of decay base (persistent)
+    device const uint16_t *A_log,    // [num_v_heads] bf16 log of decay base (persistent)
     device const uint16_t *dt_bias,  // [num_v_heads] bf16
     device float *g_decay,           // [num_v_heads] output
     device float *beta_gate,         // [num_v_heads] output
@@ -1264,7 +1264,7 @@ kernel void compute_decay_beta(
 ) {
     float a_val = alpha_out[idx];
     float dt_b = bf16_to_f32(dt_bias[idx]);
-    float A_val = exp(A_log[idx]);
+    float A_val = exp(bf16_to_f32(A_log[idx]));
     float softplus_val = log(1.0f + exp(a_val + dt_b));
     g_decay[idx] = exp(-A_val * softplus_val);
     beta_gate[idx] = 1.0f / (1.0f + exp(-beta_out[idx]));
@@ -1311,6 +1311,26 @@ kernel void gated_rms_norm(
         float w = bf16_to_f32(weight[tid]);
         output[base + tid] = normed * gate * w;
     }
+}
+
+
+// ============================================================================
+// Kernel 15: Attention output gate (attn_output_gate=true)
+// ============================================================================
+// Applies elementwise sigmoid gate to attention output before o_proj.
+// output[i] = sigmoid(gate[i]) * input[i]
+// The gate vector comes from the second half of the q_proj output (fused).
+// Dispatch: (hidden_size + 255) / 256 threadgroups, 256 threads each.
+
+kernel void apply_attn_output_gate(
+    device const float* gate   [[buffer(0)]],   // [hidden_size] gate logits
+    device float*       output [[buffer(1)]],   // [hidden_size] in/out (attn_out)
+    constant uint&      n      [[buffer(2)]],   // total elements = NUM_ATTN_HEADS * HEAD_DIM
+    uint tid [[thread_position_in_grid]]
+) {
+    if (tid >= n) return;
+    float g = 1.0f / (1.0f + exp(-gate[tid]));
+    output[tid] *= g;
 }
 
 

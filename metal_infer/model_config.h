@@ -4,16 +4,18 @@
  * Supported models:
  *   - MODEL_QWEN35_397B (default): Qwen3.5-397B-A17B-4bit
  *   - MODEL_QWEN3_CODER_480B:      Qwen3-Coder-480B-A35B-Instruct-4bit
+ *   - MODEL_QWEN36_35B_A3B:        Qwen3.6-35B-A3B-8bit
  *
- * To select a model, pass -DMODEL_QWEN3_CODER_480B via compiler flags.
- * If neither is defined, MODEL_QWEN35_397B is used as default.
+ * To select a model, pass -DMODEL_QWEN3_CODER_480B or -DMODEL_QWEN36_35B_A3B
+ * via compiler flags.  If neither is defined, MODEL_QWEN35_397B is used as
+ * default.
  */
 
 #ifndef MODEL_CONFIG_H
 #define MODEL_CONFIG_H
 
 /* ---- Default model selection ---- */
-#if !defined(MODEL_QWEN35_397B) && !defined(MODEL_QWEN3_CODER_480B)
+#if !defined(MODEL_QWEN35_397B) && !defined(MODEL_QWEN3_CODER_480B) && !defined(MODEL_QWEN36_35B_A3B)
 #define MODEL_QWEN35_397B
 #endif
 
@@ -54,6 +56,9 @@
 #define HAS_LINEAR_ATTENTION    0
 #define HAS_SHARED_EXPERT       0
 #define HAS_ATTN_GATE           0
+#define HAS_ATTN_OUTPUT_GATE    0   /* no sigmoid gate on attention output */
+#define HAS_QK_NORM             0   /* no QK-norm */
+#define FUSED_EXPERT_TENSORS    0   /* per-expert flat layout */
 
 /* All layers are full attention (every 1st layer = every layer) */
 #define FULL_ATTN_INTERVAL      1
@@ -167,6 +172,9 @@
 #define HAS_LINEAR_ATTENTION    1
 #define HAS_SHARED_EXPERT       1
 #define HAS_ATTN_GATE           1
+#define HAS_ATTN_OUTPUT_GATE    0   /* no separate attention output sigmoid gate */
+#define HAS_QK_NORM             0   /* no QK-norm */
+#define FUSED_EXPERT_TENSORS    0   /* per-expert flat layout */
 
 /* Full attention every 4th layer */
 #define FULL_ATTN_INTERVAL      4
@@ -243,6 +251,145 @@
 #define LINEAR_CONV_DIM         (LINEAR_TOTAL_KEY * 2 + LINEAR_TOTAL_VALUE) /* 12288 */
 #define CONV_KERNEL_SIZE        4
 
+/* ======================================================================== */
+#elif defined(MODEL_QWEN36_35B_A3B)
+/* ======================================================================== */
+/*
+ * Qwen3.6-35B-A3B-8bit (mlx-community)
+ *   - 40 layers: 30 linear attention (GatedDeltaNet) + 10 full attention
+ *   - full-attn at {3,7,11,15,19,23,27,31,35,39} — every 4th, starting 3
+ *   - hidden_size=2048, head_dim=256, 16 Q heads, 2 KV heads (GQA 8:1)
+ *   - 256 experts/layer, top_k=8 + 1 shared expert, moe_intermediate=512
+ *   - Partial RoPE (25% of 256 = 64 dims)
+ *   - QK-norm on full-attention Q and K (q_norm.weight / k_norm.weight)
+ *   - Sigmoid gate on attention output (attn_output_gate=true) — new vs 397B
+ *   - Fused 3D expert tensors [num_experts, ...] in safetensors
+ *   - Tensor prefix: model.language_model.* (has vision tower + MTP, ignored)
+ */
+
+#define MODEL_NAME              "Qwen3.6-35B-A3B"
+#define MODEL_ID                "qwen3.6-35b-a3b"
+
+/* Core dimensions */
+#define HIDDEN_DIM              2048
+#define NUM_LAYERS              40
+#define NUM_ATTN_HEADS          16
+#define NUM_KV_HEADS            2
+#define HEAD_DIM                256
+#define VOCAB_SIZE              248320
+#define RMS_NORM_EPS            1e-6f
+
+/* MoE */
+#define NUM_EXPERTS             256
+#define NUM_EXPERTS_PER_TOK     8
+#define MOE_INTERMEDIATE        512
+#define SHARED_INTERMEDIATE     512
+#define GROUP_SIZE              64
+#define BITS                    8
+
+/* Architecture flags */
+#define HAS_LINEAR_ATTENTION    1
+#define HAS_SHARED_EXPERT       1
+#define HAS_ATTN_GATE           0   /* Qwen3.5-397B's Q-doubled gate — not present here */
+#define HAS_ATTN_OUTPUT_GATE    1   /* NEW: sigmoid gate on attention output */
+#define HAS_QK_NORM             1   /* NEW: RMSNorm on Q and K after projection */
+#define FUSED_EXPERT_TENSORS    1   /* NEW: 3D [num_experts,...] layout in safetensors */
+
+/* Full attention every 4th layer (indices 3,7,11,...,39) */
+#define FULL_ATTN_INTERVAL      4
+#define NUM_FULL_ATTN_LAYERS    10
+#define NUM_LINEAR_LAYERS       30
+
+/* Partial RoPE (25% of HEAD_DIM = 64 dims) */
+#define ROPE_THETA              10000000.0f
+#define PARTIAL_ROTARY          0.25f
+#define ROTARY_DIM              64      /* (int)(HEAD_DIM * PARTIAL_ROTARY) */
+
+/*
+ * Expert packed binary layout (8-bit affine MLX, group_size=64)
+ *
+ * MLX 8-bit packs 4 uint8 weights into 1 uint32 (dtype "I32" in safetensors).
+ * Safetensors packed 3D shapes (all experts in one tensor):
+ *   switch_mlp.gate_proj.weight [256, 512, 512] uint32  (moe_inter=512, hidden=2048/4=512)
+ *   switch_mlp.gate_proj.scales [256, 512,  32] bf16
+ *   switch_mlp.gate_proj.biases [256, 512,  32] bf16
+ *   switch_mlp.up_proj.weight   [256, 512, 512] uint32
+ *   switch_mlp.up_proj.scales   [256, 512,  32] bf16
+ *   switch_mlp.up_proj.biases   [256, 512,  32] bf16
+ *   switch_mlp.down_proj.weight [256, 2048, 128] uint32  (hidden=2048, moe_inter=512/4=128)
+ *   switch_mlp.down_proj.scales [256, 2048,   8] bf16
+ *   switch_mlp.down_proj.biases [256, 2048,   8] bf16
+ *
+ * Per-expert packed layout (repack_experts.py canonical order, stacked per expert):
+ *   gate_proj.weight  [512,  512] uint32 = 1,048,576 bytes
+ *   gate_proj.scales  [512,   32] bf16   =    32,768 bytes
+ *   gate_proj.biases  [512,   32] bf16   =    32,768 bytes
+ *   up_proj.weight    [512,  512] uint32 = 1,048,576 bytes
+ *   up_proj.scales    [512,   32] bf16   =    32,768 bytes
+ *   up_proj.biases    [512,   32] bf16   =    32,768 bytes
+ *   down_proj.weight  [2048, 128] uint32 = 1,048,576 bytes
+ *   down_proj.scales  [2048,   8] bf16   =    32,768 bytes
+ *   down_proj.biases  [2048,   8] bf16   =    32,768 bytes
+ *   TOTAL per expert = 3,342,336 bytes
+ */
+#define EXPERT_SIZE             3342336
+
+#define GATE_W_OFF              0
+#define GATE_S_OFF              1048576
+#define GATE_B_OFF              1081344
+#define UP_W_OFF                1114112
+#define UP_S_OFF                2162688
+#define UP_B_OFF                2195456
+#define DOWN_W_OFF              2228224
+#define DOWN_S_OFF              3276800
+#define DOWN_B_OFF              3309568
+
+/* Component sizes */
+#define GATE_W_SIZE             1048576     /* [512,  512] uint32 */
+#define GATE_S_SIZE             32768       /* [512,   32] bf16   */
+#define GATE_B_SIZE             32768
+#define UP_W_SIZE               1048576     /* [512,  512] uint32 */
+#define UP_S_SIZE               32768       /* [512,   32] bf16   */
+#define UP_B_SIZE               32768
+#define DOWN_W_SIZE             1048576     /* [2048, 128] uint32 */
+#define DOWN_S_SIZE             32768       /* [2048,   8] bf16   */
+#define DOWN_B_SIZE             32768
+
+/* 2-bit expert layout (not applicable for 8-bit model) */
+#define EXPERT_SIZE_2BIT        0
+#define GATE_W_OFF_2            0
+#define GATE_S_OFF_2            0
+#define GATE_B_OFF_2            0
+#define UP_W_OFF_2              0
+#define UP_S_OFF_2              0
+#define UP_B_OFF_2              0
+#define DOWN_W_OFF_2            0
+#define DOWN_S_OFF_2            0
+#define DOWN_B_OFF_2            0
+
+/* Special tokens — same vocab as Qwen3.5-397B; verify against tokenizer.json */
+#define EOS_TOKEN_1             248046  /* <|im_end|>   — verify vs Qwen3.6 tok */
+#define EOS_TOKEN_2             248044  /* <|endoftext|> */
+#define THINK_START_TOKEN       248068  /* <think>  */
+#define THINK_END_TOKEN         248069  /* </think> */
+
+/* KV cache */
+#define MAX_SEQ_LEN             262144
+#define GPU_KV_SEQ              8192
+
+/* Default model path (user should set via --model) */
+#define MODEL_PATH_DEFAULT      ""
+
+/* Linear attention (GatedDeltaNet) constants */
+#define LINEAR_NUM_V_HEADS      32
+#define LINEAR_NUM_K_HEADS      16
+#define LINEAR_KEY_DIM          128
+#define LINEAR_VALUE_DIM        128
+#define LINEAR_TOTAL_KEY        (LINEAR_NUM_K_HEADS * LINEAR_KEY_DIM)       /* 2048 */
+#define LINEAR_TOTAL_VALUE      (LINEAR_NUM_V_HEADS * LINEAR_VALUE_DIM)     /* 4096 */
+#define LINEAR_CONV_DIM         (LINEAR_TOTAL_KEY * 2 + LINEAR_TOTAL_VALUE) /* 8192 */
+#define CONV_KERNEL_SIZE        4
+
 #endif /* model selection */
 
 /* ======================================================================== */
@@ -250,7 +397,7 @@
 /* ======================================================================== */
 
 /* Q projection output dimension: doubled if attention has sigmoid gate */
-#if HAS_ATTN_GATE
+#if HAS_ATTN_GATE || HAS_ATTN_OUTPUT_GATE
 #define Q_PROJ_DIM              (NUM_ATTN_HEADS * HEAD_DIM * 2)
 #else
 #define Q_PROJ_DIM              (NUM_ATTN_HEADS * HEAD_DIM)
