@@ -99,6 +99,7 @@ typedef struct {
     double cmd3_encode;      // CMD3 encode experts + submit (deferred)
     double total;            // total per-layer time
     int count;               // number of layers timed
+    int cmd12_fused_count;   // Task #20: layers that fused CMD1+CMD2 into 1 buffer
 } LayerTimingAccum;
 
 static LayerTimingAccum g_timing = {0};
@@ -296,8 +297,11 @@ static void timing_print(void) {
              g_timing.cpu_attn +
              g_timing.cmd2_encode + g_timing.cmd2_wait + g_timing.routing_cpu +
              g_timing.expert_io + g_timing.cmd3_encode) / n);
-    fprintf(stderr, "  cmd_buffers:    %d (3 per layer: CMD1+CMD2+CMD3)\n", n * 3);
-    fprintf(stderr, "  sync_waits:     %d (2 per layer: CMD1+CMD2, CMD3 deferred)\n", n * 2);
+    int fused = g_timing.cmd12_fused_count;
+    fprintf(stderr, "  cmd_buffers:    %d (%d fused CMD12+CMD3, %d separate CMD1+CMD2+CMD3)\n",
+            fused * 2 + (n - fused) * 3, fused, n - fused);
+    fprintf(stderr, "  sync_waits:     %d (%d fused = 1 wait, %d separate = 2 waits; CMD3 deferred)\n",
+            fused + (n - fused) * 2, fused, n - fused);
     fprintf(stderr, "  gpu_encoders:   ~%d per layer (CMD1:3-4, CMD2:8-12, CMD3:~10)\n",
             22);  // approximate
     if (g_pred_enabled && g_pred_layers > 0) {
@@ -2472,6 +2476,11 @@ static void cpu_rms_norm_gated(const float *x, const float *z, const uint16_t *w
 
 static int linear_attn_bypass = 0;  // set to 1 to skip linear attention (identity)
 static int gpu_linear_attn_enabled = 1;  // fused GPU delta-net path (can disable via --cpu-linear)
+// Task #20: fuse CMD1 + CMD2 into a single command buffer for linear-attn layers on
+// FAST PATH (gpu_linear_attn=1 && prev_gpu_combined=1). This saves one commit +
+// waitUntilCompleted pair per qualifying layer (~30/40 on Qwen3.6-35B). Default on;
+// disable via FLASHMOE_FUSE_CMD12=0 env var for A/B testing.
+static int g_fuse_cmd12 = 1;
 
 #if HAS_LINEAR_ATTENTION
 __attribute__((unused))
@@ -4241,6 +4250,7 @@ static void fused_layer_forward(
     float *residual = s_residual;
     id<MTLCommandBuffer> cmd1 = nil;
     int gpu_linear_attn = 0;  // set to 1 if GPU handles entire linear attention pipeline
+    int cmd12_fused = 0;      // Task #20: set to 1 when CMD1 encoder stays open for CMD2 reuse
 
 #if HAS_LINEAR_ATTENTION
     // Pre-compute linear_layer_idx for GPU linear attention encoding in CMD1
@@ -4370,40 +4380,60 @@ static void fused_layer_forward(
         }
 #endif /* HAS_LINEAR_ATTENTION */
 
-        [cmd1 commit];
+        // Task #20: CMD1+CMD2 fusion on linear-attn layers.
+        // When gpu_linear_attn=1, CMD1 is fully GPU-resident (no CPU intervention
+        // required before CMD2's o_proj). In this case, keep the command buffer
+        // open so the CMD2 encoders (o_proj + residual_add + norm + routing +
+        // shared gate/up) are appended into the same buffer — one commit + one
+        // waitUntilCompleted for both, saving ~150 µs/layer of commit/wait
+        // overhead × 30 linear-attn layers per token.
+        // finalize_deferred_experts() and residual setup are deferred to the
+        // CMD2 completion point (residual source is buf_moe_hidden on GPU,
+        // which is the previous CMD3's output — safe by serial queue ordering).
+        cmd12_fused = (g_fuse_cmd12 && gpu_linear_attn);
+        if (g_timing_enabled && cmd12_fused) g_timing.cmd12_fused_count++;
 
-        if (g_timing_enabled) { t1 = now_ms(); g_timing.cmd1_submit += t1 - t0; }
+        if (!cmd12_fused) {
+            [cmd1 commit];
 
-        // Wait for CMD1 (implies CMD3(N-1) also done, since queue is serial)
-        if (g_timing_enabled) { t0 = now_ms(); }
-        [cmd1 waitUntilCompleted];
-        if (!gpu_linear_attn) {
-            gpu_flush_batch_results(g_metal, attn_specs, num_attn_specs);
+            if (g_timing_enabled) { t1 = now_ms(); g_timing.cmd1_submit += t1 - t0; }
+
+            // Wait for CMD1 (implies CMD3(N-1) also done, since queue is serial)
+            if (g_timing_enabled) { t0 = now_ms(); }
+            [cmd1 waitUntilCompleted];
+            if (!gpu_linear_attn) {
+                gpu_flush_batch_results(g_metal, attn_specs, num_attn_specs);
+            }
+            if (g_timing_enabled) { t1 = now_ms(); g_timing.cmd1_wait += t1 - t0; }
+
+            // Now CMD3(N-1) is done. Read back hidden state from GPU.
+            if (g_timing_enabled) { t0 = now_ms(); }
+            finalize_deferred_experts();  // reads buf_moe_hidden -> hidden
+
+            // Start predicted expert preads AFTER CMD1_wait.
+            // CMD3(N-1) is guaranteed done (serial queue), so buf_B is safe to overwrite.
+            // Predictions overlap with CPU attn + CMD2 + routing (~0.6ms head start).
+            // Predicted experts that hit page cache (same as previous token) complete in ~0.1ms.
+            if (g_pred_enabled && g_pred_generating && g_pred_valid && packed_fd >= 0 &&
+                g_metal->buf_multi_expert_data_B[0] && g_pred_count[layer_idx] > 0) {
+                async_pread_start(packed_fd, g_pred_experts[layer_idx],
+                                  g_pred_count[layer_idx],
+                                  g_metal->buf_multi_expert_data_B, mmap_base);
+                pred_started = 1;
+            }
+            // Set up residual for CMD2 (residual = hidden before this layer's attention)
+            cpu_vec_copy(residual, hidden, HIDDEN_DIM);
+            if (g_timing_enabled) { t1 = now_ms(); g_timing.deferred_cpu += t1 - t0; }
+
+            // No input_norm needed — CMD3 already computed it into buf_input.
+            // normed is only needed if speculative routing is enabled (currently disabled).
+            // Skip the readback to avoid unnecessary overhead.
+        } else {
+            // CMD12-fused path: do not commit, do not wait. CMD1 stays open.
+            // The CMD2 block below will detect cmd12_fused and append its encoders.
+            // residual/finalize are handled after the combined commit+wait below.
+            if (g_timing_enabled) { t1 = now_ms(); g_timing.cmd1_submit += t1 - t0; }
         }
-        if (g_timing_enabled) { t1 = now_ms(); g_timing.cmd1_wait += t1 - t0; }
-
-        // Now CMD3(N-1) is done. Read back hidden state from GPU.
-        if (g_timing_enabled) { t0 = now_ms(); }
-        finalize_deferred_experts();  // reads buf_moe_hidden -> hidden
-
-        // Start predicted expert preads AFTER CMD1_wait.
-        // CMD3(N-1) is guaranteed done (serial queue), so buf_B is safe to overwrite.
-        // Predictions overlap with CPU attn + CMD2 + routing (~0.6ms head start).
-        // Predicted experts that hit page cache (same as previous token) complete in ~0.1ms.
-        if (g_pred_enabled && g_pred_generating && g_pred_valid && packed_fd >= 0 &&
-            g_metal->buf_multi_expert_data_B[0] && g_pred_count[layer_idx] > 0) {
-            async_pread_start(packed_fd, g_pred_experts[layer_idx],
-                              g_pred_count[layer_idx],
-                              g_metal->buf_multi_expert_data_B, mmap_base);
-            pred_started = 1;
-        }
-        // Set up residual for CMD2 (residual = hidden before this layer's attention)
-        cpu_vec_copy(residual, hidden, HIDDEN_DIM);
-        if (g_timing_enabled) { t1 = now_ms(); g_timing.deferred_cpu += t1 - t0; }
-
-        // No input_norm needed — CMD3 already computed it into buf_input.
-        // normed is only needed if speculative routing is enabled (currently disabled).
-        // Skip the readback to avoid unnecessary overhead.
     } else {
         // ---- ORIGINAL PATH: CPU deferred completion + input norm ----
         // Complete deferred experts from previous layer
@@ -5075,12 +5105,21 @@ static void fused_layer_forward(
                    oproj_in_dim * sizeof(float));
         }
         // gpu_linear_attn: batch_out[6] already has the result from CMD1 gated_rms_norm
-        // Copy residual into GPU buffer for residual_add kernel
-        memcpy([g_metal->buf_residual contents], residual, HIDDEN_DIM * sizeof(float));
+        // Copy residual into GPU buffer for residual_add kernel.
+        // Task #20: in cmd12_fused mode the residual is prev layer's buf_moe_hidden
+        // (still resident on GPU, not yet overwritten by the current layer's CMD3).
+        // We still need to copy it into buf_residual because buf_moe_hidden will be
+        // written later in this same command buffer? No — residual_add runs before
+        // any write to buf_moe_hidden, and buf_moe_hidden only gets written in CMD3.
+        // So we can bind buf_moe_hidden directly in residual_add (see Enc 2 below).
+        if (!cmd12_fused) {
+            memcpy([g_metal->buf_residual contents], residual, HIDDEN_DIM * sizeof(float));
+        }
 
         attn_out_for_oproj = NULL;
 
-        id<MTLCommandBuffer> cmd_fused = [g_metal->queue commandBuffer];
+        // Task #20: reuse cmd1 when CMD1+CMD2 are fused; otherwise open a new buffer.
+        id<MTLCommandBuffer> cmd_fused = cmd12_fused ? cmd1 : [g_metal->queue commandBuffer];
 
         // ---- GPU attention dispatches (only for full-attn layers with GPU path) ----
         if (gpu_attn_fuse) {
@@ -5203,13 +5242,19 @@ static void fused_layer_forward(
         }
 
         // ---- Enc 2: residual_add (buf_output + buf_residual -> buf_h_mid) ----
+        // Task #20: in cmd12_fused mode, residual source is prev layer's buf_moe_hidden
+        // (GPU-resident; guaranteed written by CMD3(N-1) before this encoder runs on
+        // the serial queue). This eliminates the GPU→CPU readback + CPU→GPU upload
+        // round-trip that the non-fused path needs.
         {
             id<MTLComputeCommandEncoder> enc = [cmd_fused computeCommandEncoder];
             uint32_t dim = HIDDEN_DIM;
+            id<MTLBuffer> resid_src = cmd12_fused ? g_metal->buf_moe_hidden
+                                                  : g_metal->buf_residual;
             [enc setComputePipelineState:g_metal->residual_add];
-            [enc setBuffer:g_metal->buf_residual offset:0 atIndex:0];  // a = residual
-            [enc setBuffer:g_metal->buf_output   offset:0 atIndex:1];  // b = o_proj result
-            [enc setBuffer:g_metal->buf_h_mid    offset:0 atIndex:2];  // out = h_mid
+            [enc setBuffer:resid_src           offset:0 atIndex:0];  // a = residual
+            [enc setBuffer:g_metal->buf_output offset:0 atIndex:1];  // b = o_proj result
+            [enc setBuffer:g_metal->buf_h_mid  offset:0 atIndex:2];  // out = h_mid
             [enc setBytes:&dim length:4 atIndex:3];
             uint32_t tgs = (dim + 255) / 256;
             [enc dispatchThreadgroups:MTLSizeMake(tgs, 1, 1)
@@ -5274,6 +5319,26 @@ static void fused_layer_forward(
         if (g_timing_enabled) { t0 = now_ms(); }
         [cmd_fused commit];
         [cmd_fused waitUntilCompleted];
+
+        // Task #20: in cmd12_fused mode, this wait implies CMD3(N-1) + CMD1(N) +
+        // CMD2(N) are ALL done (serial queue). We now finalize the previous
+        // layer's deferred experts (just reads back hidden state from
+        // buf_moe_hidden, which is still the PREV layer's value since we haven't
+        // written it this layer yet) and set up the current residual copy.
+        // Also, start predicted expert preads now (safe to overwrite buf_B).
+        if (cmd12_fused) {
+            // finalize_deferred_experts() reads prev layer's buf_moe_hidden
+            // (residual_add already consumed it as its input `a`; it wasn't
+            // written in this command buffer, so the read is still valid).
+            finalize_deferred_experts();
+            if (g_pred_enabled && g_pred_generating && g_pred_valid && packed_fd >= 0 &&
+                g_metal->buf_multi_expert_data_B[0] && g_pred_count[layer_idx] > 0) {
+                async_pread_start(packed_fd, g_pred_experts[layer_idx],
+                                  g_pred_count[layer_idx],
+                                  g_metal->buf_multi_expert_data_B, mmap_base);
+                pred_started = 1;
+            }
+        }
 
         // Read back results
         gpu_flush_batch_results(g_metal, moe_specs, num_moe_specs);
@@ -7436,6 +7501,10 @@ static void print_usage(const char *prog) {
 
 int main(int argc, char **argv) {
     @autoreleasepool {
+        // Task #20: env override for CMD1+CMD2 fusion flag
+        const char *fuse_env = getenv("FLASHMOE_FUSE_CMD12");
+        if (fuse_env && (fuse_env[0] == '0')) g_fuse_cmd12 = 0;
+
         const char *model_path = MODEL_PATH_DEFAULT;
         const char *weights_path = NULL;
         const char *manifest_path = NULL;
