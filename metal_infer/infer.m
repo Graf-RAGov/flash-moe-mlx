@@ -6751,7 +6751,7 @@ static void serve_loop(
     void **layer_states, KVCache **kv_caches,
     void **layer_mmaps, int *layer_fds,
     float *hidden, float *logits,
-    uint16_t *final_norm_w, int K)
+    uint16_t *final_norm_w, int K, int prefill_batch)
 {
     // Ignore SIGPIPE (client disconnect mid-write)
     signal(SIGPIPE, SIG_IGN);
@@ -6796,26 +6796,39 @@ static void serve_loop(
                 embed_lookup(wf, sys_pt->ids[i], sys_embed_batch + (size_t)i * HIDDEN_DIM);
             }
         }
-        // Intermediate system prompt tokens: discard last-layer expert output
-        for (int i = 0; i < sys_pt->count - 1; i++) {
-            cache_telemetry_note_token();
-            if (sys_embed_batch) {
-                memcpy(hidden, sys_embed_batch + (size_t)i * HIDDEN_DIM,
-                       HIDDEN_DIM * sizeof(float));
-            } else {
-                embed_lookup(wf, sys_pt->ids[i], hidden);
+        int batch_w = prefill_batch > 0 ? prefill_batch : 1;
+        if (batch_w > sys_pt->count - 1) batch_w = sys_pt->count - 1;
+        if (batch_w < 1) batch_w = 1;
+
+        // Intermediate system prompt tokens: discard last-layer expert output.
+        int token_idx = 0;
+        while (token_idx < sys_pt->count - 1) {
+            int window = sys_pt->count - 1 - token_idx;
+            if (window > batch_w) window = batch_w;
+
+            for (int w = 0; w < window; w++) {
+                int i = token_idx + w;
+                cache_telemetry_note_token();
+                if (sys_embed_batch) {
+                    memcpy(hidden, sys_embed_batch + (size_t)i * HIDDEN_DIM,
+                           HIDDEN_DIM * sizeof(float));
+                } else {
+                    embed_lookup(wf, sys_pt->ids[i], hidden);
+                }
+                for (int layer = 0; layer < NUM_LAYERS; layer++) {
+                    int is_full = ((layer + 1) % FULL_ATTN_INTERVAL == 0);
+                    fused_layer_forward(wf, layer, hidden,
+                                        is_full ? kv_caches[layer] : NULL,
+                                        is_full ? NULL : layer_states[layer],
+                                        sys_pos,
+                                        layer_mmaps[layer] != MAP_FAILED ? layer_mmaps[layer] : NULL,
+                                        K, layer_fds[layer]);
+                }
+                discard_deferred_experts();
+                sys_pos++;
             }
-            for (int layer = 0; layer < NUM_LAYERS; layer++) {
-                int is_full = ((layer + 1) % FULL_ATTN_INTERVAL == 0);
-                fused_layer_forward(wf, layer, hidden,
-                                    is_full ? kv_caches[layer] : NULL,
-                                    is_full ? NULL : layer_states[layer],
-                                    sys_pos,
-                                    layer_mmaps[layer] != MAP_FAILED ? layer_mmaps[layer] : NULL,
-                                    K, layer_fds[layer]);
-            }
-            discard_deferred_experts();
-            sys_pos++;
+
+            token_idx += window;
         }
         // Last system prompt token: full completion
         {
@@ -7157,44 +7170,65 @@ static void serve_loop(
             }
             // Intermediate prefill tokens: discard last-layer expert output
             int prefill_aborted = 0;
-            for (int i = 0; i < pt->count - 1; i++) {
-                cache_telemetry_note_token();
-                if (serve_embed_batch) {
-                    memcpy(hidden, serve_embed_batch + (size_t)i * HIDDEN_DIM,
-                           HIDDEN_DIM * sizeof(float));
-                } else {
-                    embed_lookup(wf, pt->ids[i], hidden);
-                }
-                for (int layer = 0; layer < NUM_LAYERS; layer++) {
-                    int is_full = ((layer + 1) % FULL_ATTN_INTERVAL == 0);
-                    fused_layer_forward(wf, layer, hidden,
-                                        is_full ? kv_caches[layer] : NULL,
-                                        is_full ? NULL : layer_states[layer],
-                                        pos,
-                                        layer_mmaps[layer] != MAP_FAILED ? layer_mmaps[layer] : NULL,
-                                        K, layer_fds[layer]);
-                }
-                discard_deferred_experts();
-                pos++;
+            int batch_w = prefill_batch > 0 ? prefill_batch : 1;
+            if (batch_w > pt->count - 1) batch_w = pt->count - 1;
+            if (batch_w < 1) batch_w = 1;
+            if (pt->count > 1) {
+                serve_log("%s prefill mode=%s window=%d\n",
+                          request_id,
+                          batch_w == 1 ? "serial" : "batched-window",
+                          batch_w);
+            }
 
-                // Progress + client disconnect check every 500 tokens
-                if ((i + 1) % 500 == 0) {
-                    double elapsed = now_ms() - t_prefill;
-                    double tok_per_s = (i + 1) * 1000.0 / elapsed;
-                    double eta_s = (pt->count - i - 1) / tok_per_s;
-                    serve_log("%s prefill progress: %d/%d tokens (%.1f tok/s, ETA %.0fs)\n",
-                              request_id, i + 1, pt->count, tok_per_s, eta_s);
+            int prefill_done = 0;
+            int token_idx = 0;
+            while (!prefill_aborted && token_idx < pt->count - 1) {
+                int window = pt->count - 1 - token_idx;
+                if (window > batch_w) window = batch_w;
 
-                    // Check if client disconnected (non-blocking poll)
-                    char probe;
-                    ssize_t r = recv(client_fd, &probe, 1, MSG_PEEK | MSG_DONTWAIT);
-                    if (r == 0) {
-                        serve_log("%s client disconnected during prefill at token %d/%d\n",
-                                  request_id, i + 1, pt->count);
-                        prefill_aborted = 1;
-                        break;
+                for (int w = 0; w < window; w++) {
+                    int i = token_idx + w;
+                    cache_telemetry_note_token();
+                    if (serve_embed_batch) {
+                        memcpy(hidden, serve_embed_batch + (size_t)i * HIDDEN_DIM,
+                               HIDDEN_DIM * sizeof(float));
+                    } else {
+                        embed_lookup(wf, pt->ids[i], hidden);
+                    }
+                    for (int layer = 0; layer < NUM_LAYERS; layer++) {
+                        int is_full = ((layer + 1) % FULL_ATTN_INTERVAL == 0);
+                        fused_layer_forward(wf, layer, hidden,
+                                            is_full ? kv_caches[layer] : NULL,
+                                            is_full ? NULL : layer_states[layer],
+                                            pos,
+                                            layer_mmaps[layer] != MAP_FAILED ? layer_mmaps[layer] : NULL,
+                                            K, layer_fds[layer]);
+                    }
+                    discard_deferred_experts();
+                    pos++;
+                    prefill_done++;
+
+                    // Progress + client disconnect check every 500 tokens
+                    if ((prefill_done % 500) == 0) {
+                        double elapsed = now_ms() - t_prefill;
+                        double tok_per_s = prefill_done * 1000.0 / elapsed;
+                        double eta_s = (pt->count - prefill_done) / tok_per_s;
+                        serve_log("%s prefill progress: %d/%d tokens (%.1f tok/s, ETA %.0fs)\n",
+                                  request_id, prefill_done, pt->count, tok_per_s, eta_s);
+
+                        // Check if client disconnected (non-blocking poll)
+                        char probe;
+                        ssize_t r = recv(client_fd, &probe, 1, MSG_PEEK | MSG_DONTWAIT);
+                        if (r == 0) {
+                            serve_log("%s client disconnected during prefill at token %d/%d\n",
+                                      request_id, prefill_done, pt->count);
+                            prefill_aborted = 1;
+                            break;
+                        }
                     }
                 }
+
+                token_idx += window;
             }
             // Last prefill token: full completion (need hidden for logits)
             if (!prefill_aborted) {
@@ -7431,6 +7465,7 @@ static void print_usage(const char *prog) {
     printf("  --collect-routing F  Log routing data to binary file F (for predictor training)\n");
     printf("  --think-budget N     Max thinking tokens before force </think> (default: 2048, 0=unlimited)\n");
     printf("  --serve PORT         Run HTTP server (OpenAI-compatible API)\n");
+    printf("  --prefill-batch N    Batched prefill window (default: 1 = serial, 8/32/64 typical)\n");
     printf("  --help               This message\n");
 }
 
@@ -7448,6 +7483,7 @@ int main(int argc, char **argv) {
         int cache_entries = 0;  // default 0: trust OS page cache (38% faster than Metal LRU)
         int malloc_cache_entries = 0;  // 0 = disabled (override with --malloc-cache)
         int serve_port = 0;  // 0 = disabled, >0 = HTTP serve mode
+        int prefill_batch = 1;  // 1 = serial prefill (backward compatible default)
 
         static struct option long_options[] = {
             {"model",         required_argument, 0, 'm'},
@@ -7472,12 +7508,13 @@ int main(int argc, char **argv) {
             {"serve",         required_argument, 0, 'R'},
             {"predict",       no_argument,       0, 'D'},
             {"collect-routing", required_argument, 0, 'Z'},
+            {"prefill-batch", required_argument, 0, 'N'},
             {"help",          no_argument,       0, 'h'},
             {0, 0, 0, 0}
         };
 
         int c;
-        while ((c = getopt_long(argc, argv, "m:w:j:v:p:P:t:k:C:M:R:B:LSTFE2GQh", long_options, NULL)) != -1) {
+        while ((c = getopt_long(argc, argv, "m:w:j:v:p:P:t:k:C:M:R:B:N:LSTFE2GQh", long_options, NULL)) != -1) {
             switch (c) {
                 case 'm': model_path = optarg; break;
                 case 'w': weights_path = optarg; break;
@@ -7507,6 +7544,14 @@ int main(int argc, char **argv) {
                     break;
                 case 'B': g_think_budget = atoi(optarg); break;
                 case 'R': serve_port = atoi(optarg); break;
+                case 'N':
+                    prefill_batch = atoi(optarg);
+                    if (prefill_batch < 1) prefill_batch = 1;
+                    if (prefill_batch > 128) {
+                        fprintf(stderr, "WARN: --prefill-batch > 128 clamped to 128\n");
+                        prefill_batch = 128;
+                    }
+                    break;
                 case 'h': print_usage(argv[0]); return 0;
                 default:  print_usage(argv[0]); return 1;
             }
@@ -7783,7 +7828,7 @@ int main(int argc, char **argv) {
             serve_loop(serve_port, wf, vocab,
                        layer_states, kv_caches,
                        (void **)layer_mmaps, layer_fds,
-                       hidden, logits, final_norm_w, K);
+                       hidden, logits, final_norm_w, K, prefill_batch);
             // serve_loop never returns, but cleanup just in case
             free(hidden); free(logits);
             return 0;
@@ -7819,34 +7864,43 @@ int main(int argc, char **argv) {
         if (pt->count > 1) {
             double t_prefill_batch = now_ms();
             double first_tok_ms = 0;
+            int batch_w = prefill_batch > 0 ? prefill_batch : 1;
+            if (batch_w > pt->count - 1) batch_w = pt->count - 1;
+            if (batch_w < 1) batch_w = 1;
+            printf("  [prefill] mode=%s window=%d\n",
+                   batch_w == 1 ? "serial" : "batched-window", batch_w);
 
-            for (int token_idx = 0; token_idx < pt->count - 1; token_idx++) {
-                double t_tok = now_ms();
+            int token_idx = 0;
+            while (token_idx < pt->count - 1) {
+                int window = pt->count - 1 - token_idx;
+                if (window > batch_w) window = batch_w;
 
-                // Load pre-embedded token from batch buffer
-                cache_telemetry_note_token();
-                memcpy(hidden, embed_batch + (size_t)token_idx * HIDDEN_DIM,
-                       HIDDEN_DIM * sizeof(float));
+                for (int w = 0; w < window; w++) {
+                    double t_tok = now_ms();
 
-                // Run through all 60 transformer layers
-                for (int layer = 0; layer < NUM_LAYERS; layer++) {
-                    int is_full = ((layer + 1) % FULL_ATTN_INTERVAL == 0);
-                    fused_layer_forward(wf, layer, hidden,
-                                        is_full ? kv_caches[layer] : NULL,
-                                        is_full ? NULL : layer_states[layer],
-                                        pos,
-                                        layer_mmaps[layer] != MAP_FAILED ? layer_mmaps[layer] : NULL,
-                                        K, layer_fds[layer]);
+                    cache_telemetry_note_token();
+                    memcpy(hidden, embed_batch + (size_t)(token_idx + w) * HIDDEN_DIM,
+                           HIDDEN_DIM * sizeof(float));
+
+                    for (int layer = 0; layer < NUM_LAYERS; layer++) {
+                        int is_full = ((layer + 1) % FULL_ATTN_INTERVAL == 0);
+                        fused_layer_forward(wf, layer, hidden,
+                                            is_full ? kv_caches[layer] : NULL,
+                                            is_full ? NULL : layer_states[layer],
+                                            pos,
+                                            layer_mmaps[layer] != MAP_FAILED ? layer_mmaps[layer] : NULL,
+                                            K, layer_fds[layer]);
+                    }
+
+                    discard_deferred_experts();
+                    pos++;
+
+                    if (token_idx == 0 && w == 0) {
+                        first_tok_ms = now_ms() - t_tok;
+                    }
                 }
 
-                // Discard last layer's expert output — hidden will be overwritten
-                // by the next token's embedding. Only wait for GPU (buffer safety).
-                discard_deferred_experts();
-                pos++;
-
-                if (token_idx == 0) {
-                    first_tok_ms = now_ms() - t_tok;
-                }
+                token_idx += window;
             }
 
             double prefill_batch_ms = now_ms() - t_prefill_batch;
