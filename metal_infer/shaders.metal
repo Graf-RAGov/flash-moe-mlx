@@ -493,6 +493,74 @@ kernel void dequant_matvec_2bit(
 
 
 // ============================================================================
+// Kernel 1e: 8-bit dequantized matrix-vector multiply (FMA-optimized)
+// ============================================================================
+// Same structure as dequant_matvec_4bit_v3 but for 8-bit quantization:
+//   - 4 values per uint32 (vs 8 for 4-bit, 16 for 2-bit)
+//   - packed_cols = in_dim / 4
+//   - Extract bytes: (packed >> 0) & 0xFF, >> 8, >> 16, >> 24
+//   - FMA-optimized: (byte * scale + bias) * x = fma(byte, scale*x, bias*x)
+// Used for gate routing weights and shared_expert_gate in Qwen3.5-397B.
+
+kernel void dequant_matvec_8bit(
+    device const uint32_t* W_packed   [[buffer(0)]],  // [out_dim, in_dim/4]
+    device const uint16_t* scales     [[buffer(1)]],  // [out_dim, num_groups] bf16
+    device const uint16_t* biases     [[buffer(2)]],  // [out_dim, num_groups] bf16
+    device const float*    x          [[buffer(3)]],  // [in_dim]
+    device float*          out        [[buffer(4)]],  // [out_dim]
+    constant uint&         out_dim    [[buffer(5)]],
+    constant uint&         in_dim     [[buffer(6)]],
+    constant uint&         group_size [[buffer(7)]],
+    uint tgid       [[threadgroup_position_in_grid]],
+    uint lid        [[thread_position_in_threadgroup]],
+    uint simd_lane  [[thread_index_in_simdgroup]],
+    uint simd_group [[simdgroup_index_in_threadgroup]]
+) {
+    uint row = tgid * ROWS_PER_TG + simd_group;
+    uint packed_cols = in_dim / 4;  // 4 values per uint32 for 8-bit
+    uint num_groups  = in_dim / group_size;
+
+    threadgroup float x_shared[4096];
+    for (uint i = lid; i < in_dim; i += 256) {
+        x_shared[i] = x[i];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (row >= out_dim) return;
+
+    device const uint32_t* w_row = W_packed + row * packed_cols;
+    device const uint16_t* s_row = scales + row * num_groups;
+    device const uint16_t* b_row = biases + row * num_groups;
+
+    float acc = 0.0f;
+
+    for (uint col = simd_lane; col < packed_cols; col += 32) {
+        // group_size/4 packed words per group
+        uint g = col / (group_size / 4);
+        float scale = bf16_to_f32(s_row[g]);
+        float bias  = bf16_to_f32(b_row[g]);
+
+        uint32_t packed = w_row[col];
+        uint x_base = col * 4;
+
+        float sx0 = scale * x_shared[x_base + 0];  float bx0 = bias * x_shared[x_base + 0];
+        float sx1 = scale * x_shared[x_base + 1];  float bx1 = bias * x_shared[x_base + 1];
+        float sx2 = scale * x_shared[x_base + 2];  float bx2 = bias * x_shared[x_base + 2];
+        float sx3 = scale * x_shared[x_base + 3];  float bx3 = bias * x_shared[x_base + 3];
+
+        acc += fma(float((packed >>  0) & 0xFF), sx0, bx0);
+        acc += fma(float((packed >>  8) & 0xFF), sx1, bx1);
+        acc += fma(float((packed >> 16) & 0xFF), sx2, bx2);
+        acc += fma(float((packed >> 24) & 0xFF), sx3, bx3);
+    }
+
+    float sum = simd_sum(acc);
+    if (simd_lane == 0) {
+        out[row] = sum;
+    }
+}
+
+
+// ============================================================================
 // Kernel 1d: FULLY OPTIMIZED with uint4 vector loads
 // ============================================================================
 //
@@ -1188,7 +1256,7 @@ kernel void rms_norm_qk(
 kernel void compute_decay_beta(
     device const float *alpha_out,   // [num_v_heads] from projection
     device const float *beta_out,    // [num_v_heads] from projection
-    device const float *A_log,       // [num_v_heads] log of decay base (persistent)
+    device const uint16_t *A_log,    // [num_v_heads] bf16 log of decay base (persistent)
     device const uint16_t *dt_bias,  // [num_v_heads] bf16
     device float *g_decay,           // [num_v_heads] output
     device float *beta_gate,         // [num_v_heads] output
@@ -1196,7 +1264,7 @@ kernel void compute_decay_beta(
 ) {
     float a_val = alpha_out[idx];
     float dt_b = bf16_to_f32(dt_bias[idx]);
-    float A_val = exp(A_log[idx]);
+    float A_val = exp(bf16_to_f32(A_log[idx]));
     float softplus_val = log(1.0f + exp(a_val + dt_b));
     g_decay[idx] = exp(-A_val * softplus_val);
     beta_gate[idx] = 1.0f / (1.0f + exp(-beta_out[idx]));
@@ -1243,6 +1311,26 @@ kernel void gated_rms_norm(
         float w = bf16_to_f32(weight[tid]);
         output[base + tid] = normed * gate * w;
     }
+}
+
+
+// ============================================================================
+// Kernel 15: Attention output gate (attn_output_gate=true)
+// ============================================================================
+// Applies elementwise sigmoid gate to attention output before o_proj.
+// output[i] = sigmoid(gate[i]) * input[i]
+// The gate vector comes from the second half of the q_proj output (fused).
+// Dispatch: (hidden_size + 255) / 256 threadgroups, 256 threads each.
+
+kernel void apply_attn_output_gate(
+    device const float* gate   [[buffer(0)]],   // [hidden_size] gate logits
+    device float*       output [[buffer(1)]],   // [hidden_size] in/out (attn_out)
+    constant uint&      n      [[buffer(2)]],   // total elements = NUM_ATTN_HEADS * HEAD_DIM
+    uint tid [[thread_position_in_grid]]
+) {
+    if (tid >= n) return;
+    float g = 1.0f / (1.0f + exp(-gate[tid]));
+    output[tid] *= g;
 }
 
 
