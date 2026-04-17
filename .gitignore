@@ -38,3 +38,8 @@ metal_infer/routing_data.bin
 
 # asdf
 .tool-versions
+
+# Local workspace
+.claude/
+# Data symlinks
+metal_infer/packed_experts

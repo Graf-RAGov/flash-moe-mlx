@@ -941,7 +941,7 @@ typedef struct {
     id<MTLBuffer> buf_attn_q;       // [NUM_ATTN_HEADS * HEAD_DIM floats] all query heads
     id<MTLBuffer> buf_attn_scores;  // [NUM_ATTN_HEADS * MAX_SEQ_LEN floats] all heads' scores
     id<MTLBuffer> buf_attn_out;     // [NUM_ATTN_HEADS * HEAD_DIM floats] full attention output
-#if HAS_ATTN_GATE
+#if HAS_ATTN_GATE || HAS_ATTN_OUTPUT_GATE
     id<MTLBuffer> buf_attn_gate;    // [NUM_ATTN_HEADS * HEAD_DIM floats] sigmoid gate
 #endif
     // CMD3 GPU-side combine buffers (weighted_sum + residual + norm on GPU)
@@ -1039,7 +1039,7 @@ static MetalCtx *metal_setup(void) {
     ctx->attn_scores_pipe  = makePipe(@"attn_scores_batched");
     ctx->attn_softmax_pipe = makePipe(@"attn_softmax_batched");
     ctx->attn_values_pipe  = makePipe(@"attn_values_batched");
-#if HAS_ATTN_GATE
+#if HAS_ATTN_GATE || HAS_ATTN_OUTPUT_GATE
     ctx->sigmoid_gate_pipe = makePipe(@"sigmoid_gate");
 #endif
     ctx->moe_combine_residual = makePipe(@"moe_combine_residual");
@@ -1177,7 +1177,7 @@ static MetalCtx *metal_setup(void) {
                                                         options:MTLResourceStorageModeShared];
         ctx->buf_attn_out    = [ctx->device newBufferWithLength:NUM_ATTN_HEADS * HEAD_DIM * sizeof(float)
                                                         options:MTLResourceStorageModeShared];
-#if HAS_ATTN_GATE
+#if HAS_ATTN_GATE || HAS_ATTN_OUTPUT_GATE
         ctx->buf_attn_gate   = [ctx->device newBufferWithLength:NUM_ATTN_HEADS * HEAD_DIM * sizeof(float)
                                                         options:MTLResourceStorageModeShared];
 #endif
@@ -1289,6 +1289,21 @@ static void gpu_dequant_matvec(
     id<MTLCommandBuffer> cmdbuf = [ctx->queue commandBuffer];
     id<MTLComputeCommandEncoder> enc = [cmdbuf computeCommandEncoder];
 
+#if BITS == 8
+    // 8-bit model: use the 8-bit kernel for all non-expert projections
+    [enc setComputePipelineState: ctx->matvec_8bit];
+    [enc setBuffer:ctx->wf_buf  offset:w_off atIndex:0];
+    [enc setBuffer:ctx->wf_buf  offset:s_off atIndex:1];
+    [enc setBuffer:ctx->wf_buf  offset:b_off atIndex:2];
+    [enc setBuffer:ctx->buf_input offset:0   atIndex:3];
+    [enc setBuffer:o_buf        offset:0     atIndex:4];
+    [enc setBytes:&out_dim      length:4     atIndex:5];
+    [enc setBytes:&in_dim       length:4     atIndex:6];
+    [enc setBytes:&group_size   length:4     atIndex:7];
+    uint32_t num_tgs_8 = (out_dim + 7) / 8;
+    [enc dispatchThreadgroups:MTLSizeMake(num_tgs_8, 1, 1)
+        threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+#else
     // v3 shader uses x_shared[4096], so can only handle in_dim <= 4096
     // For larger in_dim (e.g. o_proj with in_dim=8192), use matvec_fast
     int use_v3 = (in_dim <= 4096);
@@ -1303,16 +1318,15 @@ static void gpu_dequant_matvec(
     [enc setBytes:&group_size   length:4     atIndex:7];
 
     if (use_v3) {
-        // v3: tiled threadgroups, 256 threads, 8 rows per TG
         uint32_t num_tgs = (out_dim + 7) / 8;
         [enc dispatchThreadgroups:MTLSizeMake(num_tgs, 1, 1)
             threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
     } else {
-        // fast: one threadgroup per output row, 64 threads per TG
         NSUInteger tg_size = 64;
         [enc dispatchThreadgroups:MTLSizeMake(out_dim, 1, 1)
             threadsPerThreadgroup:MTLSizeMake(tg_size, 1, 1)];
     }
+#endif
     [enc endEncoding];
     [cmdbuf commit];
     [cmdbuf waitUntilCompleted];
@@ -1331,7 +1345,11 @@ static void fast_dequant_matvec(
         gpu_dequant_matvec(g_metal, W, scales, biases, x, out,
                            (uint32_t)out_dim, (uint32_t)in_dim, (uint32_t)group_size);
     } else {
+#if BITS == 8
+        cpu_dequant_matvec_8bit(W, scales, biases, x, out, out_dim, in_dim, group_size);
+#else
         cpu_dequant_matvec(W, scales, biases, x, out, out_dim, in_dim, group_size);
+#endif
     }
 }
 
@@ -1483,8 +1501,6 @@ static void gpu_encode_dequant_matvec_with_io_bufs(
     NSUInteger b_off = (NSUInteger)((const char *)biases  - (const char *)[ctx->wf_buf contents]);
 
     id<MTLComputeCommandEncoder> enc = [cmdbuf computeCommandEncoder];
-    int use_v3 = (in_dim <= 4096);
-    [enc setComputePipelineState: use_v3 ? ctx->matvec_v3 : ctx->matvec_fast];
     [enc setBuffer:ctx->wf_buf offset:w_off atIndex:0];
     [enc setBuffer:ctx->wf_buf offset:s_off atIndex:1];
     [enc setBuffer:ctx->wf_buf offset:b_off atIndex:2];
@@ -1493,15 +1509,27 @@ static void gpu_encode_dequant_matvec_with_io_bufs(
     [enc setBytes:&out_dim     length:4     atIndex:5];
     [enc setBytes:&in_dim      length:4     atIndex:6];
     [enc setBytes:&group_size  length:4     atIndex:7];
-
-    if (use_v3) {
+#if BITS == 8
+    [enc setComputePipelineState: ctx->matvec_8bit];
+    {
         uint32_t num_tgs = (out_dim + 7) / 8;
         [enc dispatchThreadgroups:MTLSizeMake(num_tgs, 1, 1)
             threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
-    } else {
-        [enc dispatchThreadgroups:MTLSizeMake(out_dim, 1, 1)
-            threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
     }
+#else
+    {
+        int use_v3 = (in_dim <= 4096);
+        [enc setComputePipelineState: use_v3 ? ctx->matvec_v3 : ctx->matvec_fast];
+        if (use_v3) {
+            uint32_t num_tgs = (out_dim + 7) / 8;
+            [enc dispatchThreadgroups:MTLSizeMake(num_tgs, 1, 1)
+                threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        } else {
+            [enc dispatchThreadgroups:MTLSizeMake(out_dim, 1, 1)
+                threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+        }
+    }
+#endif
     [enc endEncoding];
 }
 
@@ -1525,7 +1553,7 @@ static void gpu_encode_expert_forward_slot(
         up_w_off   = UP_W_OFF;     up_s_off   = UP_S_OFF;     up_b_off   = UP_B_OFF;
         down_w_off = DOWN_W_OFF;   down_s_off = DOWN_S_OFF;   down_b_off = DOWN_B_OFF;
     }
-    id<MTLComputePipelineState> expert_pipe = g_use_2bit ? ctx->matvec_2bit : ctx->matvec_v3;
+    id<MTLComputePipelineState> expert_pipe = g_use_2bit ? ctx->matvec_2bit : (BITS == 8 ? ctx->matvec_8bit : ctx->matvec_v3);
 
     uint32_t gate_up_out = MOE_INTERMEDIATE;
     uint32_t gate_up_in  = HIDDEN_DIM;
@@ -1621,7 +1649,7 @@ static void gpu_encode_expert_forward_slot_buf(
         up_w_off   = UP_W_OFF;     up_s_off   = UP_S_OFF;     up_b_off   = UP_B_OFF;
         down_w_off = DOWN_W_OFF;   down_s_off = DOWN_S_OFF;   down_b_off = DOWN_B_OFF;
     }
-    id<MTLComputePipelineState> expert_pipe = g_use_2bit ? ctx->matvec_2bit : ctx->matvec_v3;
+    id<MTLComputePipelineState> expert_pipe = g_use_2bit ? ctx->matvec_2bit : (BITS == 8 ? ctx->matvec_8bit : ctx->matvec_v3);
 
     uint32_t gate_up_out = MOE_INTERMEDIATE;
     uint32_t gate_up_in  = HIDDEN_DIM;
@@ -1721,7 +1749,7 @@ static void gpu_encode_experts_batched(
         up_w_off   = UP_W_OFF;     up_s_off   = UP_S_OFF;     up_b_off   = UP_B_OFF;
         down_w_off = DOWN_W_OFF;   down_s_off = DOWN_S_OFF;   down_b_off = DOWN_B_OFF;
     }
-    id<MTLComputePipelineState> expert_pipe = g_use_2bit ? ctx->matvec_2bit : ctx->matvec_v3;
+    id<MTLComputePipelineState> expert_pipe = g_use_2bit ? ctx->matvec_2bit : (BITS == 8 ? ctx->matvec_8bit : ctx->matvec_v3);
 
     uint32_t gate_up_out = MOE_INTERMEDIATE;
     uint32_t gate_up_in  = HIDDEN_DIM;
@@ -1818,10 +1846,17 @@ static void gpu_encode_expert_forward(
     uint32_t down_in     = MOE_INTERMEDIATE;
     uint32_t gs          = GROUP_SIZE;
 
+    // Select expert kernel based on BITS (4-bit vs 8-bit)
+#if BITS == 8
+    id<MTLComputePipelineState> expert_kernel = ctx->matvec_8bit;
+#else
+    id<MTLComputePipelineState> expert_kernel = ctx->matvec_v3;
+#endif
+
     // gate_proj
     {
         id<MTLComputeCommandEncoder> enc = [cmdbuf computeCommandEncoder];
-        [enc setComputePipelineState:ctx->matvec_v3];
+        [enc setComputePipelineState:expert_kernel];
         [enc setBuffer:ctx->buf_expert_data  offset:gate_w_off  atIndex:0];
         [enc setBuffer:ctx->buf_expert_data  offset:gate_s_off  atIndex:1];
         [enc setBuffer:ctx->buf_expert_data  offset:gate_b_off  atIndex:2];
@@ -1838,7 +1873,7 @@ static void gpu_encode_expert_forward(
     // up_proj
     {
         id<MTLComputeCommandEncoder> enc = [cmdbuf computeCommandEncoder];
-        [enc setComputePipelineState:ctx->matvec_v3];
+        [enc setComputePipelineState:expert_kernel];
         [enc setBuffer:ctx->buf_expert_data  offset:up_w_off  atIndex:0];
         [enc setBuffer:ctx->buf_expert_data  offset:up_s_off  atIndex:1];
         [enc setBuffer:ctx->buf_expert_data  offset:up_b_off  atIndex:2];
@@ -1868,7 +1903,7 @@ static void gpu_encode_expert_forward(
     // down_proj
     {
         id<MTLComputeCommandEncoder> enc = [cmdbuf computeCommandEncoder];
-        [enc setComputePipelineState:ctx->matvec_v3];
+        [enc setComputePipelineState:expert_kernel];
         [enc setBuffer:ctx->buf_expert_data offset:down_w_off  atIndex:0];
         [enc setBuffer:ctx->buf_expert_data offset:down_s_off  atIndex:1];
         [enc setBuffer:ctx->buf_expert_data offset:down_b_off  atIndex:2];
@@ -1935,7 +1970,7 @@ static void gpu_expert_forward(
         up_w_off   = UP_W_OFF;     up_s_off   = UP_S_OFF;     up_b_off   = UP_B_OFF;
         down_w_off = DOWN_W_OFF;   down_s_off = DOWN_S_OFF;   down_b_off = DOWN_B_OFF;
     }
-    id<MTLComputePipelineState> expert_pipe = g_use_2bit ? ctx->matvec_2bit : ctx->matvec_v3;
+    id<MTLComputePipelineState> expert_pipe = g_use_2bit ? ctx->matvec_2bit : (BITS == 8 ? ctx->matvec_8bit : ctx->matvec_v3);
 
     // Copy expert weights into Metal buffer only if not already there
     if (!expert_data_already_in_buffer) {
@@ -2167,7 +2202,15 @@ static void full_attention_forward(
     }
 
     // ---- QKV Projection ----
+    // HAS_ATTN_OUTPUT_GATE: gate is fused into q_proj output (doubled width),
+    // so q_proj output is [NUM_ATTN_HEADS * HEAD_DIM * 2] — first half is Q,
+    // second half is the per-element sigmoid gate applied before o_proj.
+    // This is the same mechanism as HAS_ATTN_GATE but triggered by a separate flag.
+#if HAS_ATTN_OUTPUT_GATE
+    int q_proj_dim = NUM_ATTN_HEADS * HEAD_DIM * 2;
+#else
     int q_proj_dim = Q_PROJ_DIM;
+#endif
     int q_dim = NUM_ATTN_HEADS * HEAD_DIM;
     int kv_dim = NUM_KV_HEADS * HEAD_DIM;
 
@@ -2200,9 +2243,9 @@ static void full_attention_forward(
     // Batch Q/K/V into one command buffer (3 dispatches, 1 commit)
     if (qw && qs && qb && kw && ks && kb && vw && vs && vb) {
         BatchMatvecSpec qkv_specs[3] = {
-            { qw, qs, qb, q_proj_out, (uint32_t)q_proj_dim, HIDDEN_DIM, GROUP_SIZE, 0, 4 },
-            { kw, ks, kb, k,          (uint32_t)kv_dim,     HIDDEN_DIM, GROUP_SIZE, 1, 4 },
-            { vw, vs, vb, v,          (uint32_t)kv_dim,     HIDDEN_DIM, GROUP_SIZE, 2, 4 },
+            { qw, qs, qb, q_proj_out, (uint32_t)q_proj_dim, HIDDEN_DIM, GROUP_SIZE, 0, BITS },
+            { kw, ks, kb, k,          (uint32_t)kv_dim,     HIDDEN_DIM, GROUP_SIZE, 1, BITS },
+            { vw, vs, vb, v,          (uint32_t)kv_dim,     HIDDEN_DIM, GROUP_SIZE, 2, BITS },
         };
         fast_batch_matvec(normed, HIDDEN_DIM, qkv_specs, 3);
     }
@@ -2220,6 +2263,14 @@ static void full_attention_forward(
         float *src = q_proj_out + h * (2 * HEAD_DIM);
         memcpy(q + h * HEAD_DIM, src, HEAD_DIM * sizeof(float));
         memcpy(q_gate + h * HEAD_DIM, src + HEAD_DIM, HEAD_DIM * sizeof(float));
+    }
+#elif HAS_ATTN_OUTPUT_GATE
+    // Gate fused into q_proj: first half = Q queries, second half = gate logits
+    float *q_out_gate = calloc(q_dim, sizeof(float));
+    for (int h = 0; h < NUM_ATTN_HEADS; h++) {
+        float *src = q_proj_out + h * (2 * HEAD_DIM);
+        memcpy(q + h * HEAD_DIM, src, HEAD_DIM * sizeof(float));
+        memcpy(q_out_gate + h * HEAD_DIM, src + HEAD_DIM, HEAD_DIM * sizeof(float));
     }
 #else
     memcpy(q, q_proj_out, q_dim * sizeof(float));
@@ -2240,13 +2291,14 @@ static void full_attention_forward(
 #endif
     }
 
-    // ---- Q/K RMSNorm ----
+    // ---- Q/K RMSNorm (applied before RoPE, per Qwen3.6 architecture) ----
+#if HAS_QK_NORM
     snprintf(name, sizeof(name), "model.layers.%d.self_attn.q_norm.weight", layer_idx);
     uint16_t *qnorm_w = get_tensor_ptr(wf, name);
     snprintf(name, sizeof(name), "model.layers.%d.self_attn.k_norm.weight", layer_idx);
     uint16_t *knorm_w = get_tensor_ptr(wf, name);
 
-    // Apply per-head Q norm
+    // Apply per-head Q RMSNorm with learned weight [HEAD_DIM]
     if (qnorm_w) {
         for (int h = 0; h < NUM_ATTN_HEADS; h++) {
             float *qh = q + h * HEAD_DIM;
@@ -2258,7 +2310,7 @@ static void full_attention_forward(
             }
         }
     }
-    // Apply per-head K norm
+    // Apply per-head K RMSNorm with learned weight [HEAD_DIM]
     if (knorm_w) {
         for (int h = 0; h < NUM_KV_HEADS; h++) {
             float *kh = k + h * HEAD_DIM;
@@ -2270,7 +2322,7 @@ static void full_attention_forward(
             }
         }
     }
-
+#endif /* HAS_QK_NORM */
 
     // ---- RoPE ----
     apply_rotary_emb(q, k, pos, NUM_ATTN_HEADS, NUM_KV_HEADS, HEAD_DIM, ROTARY_DIM);
@@ -2328,6 +2380,14 @@ static void full_attention_forward(
         attn_out[i] *= g;
     }
 #endif
+#if HAS_ATTN_OUTPUT_GATE
+    // Qwen3.6: attn_output_gate — sigmoid gate from fused q_proj second half
+    // Applied elementwise before o_proj: attn_out[i] *= sigmoid(q_out_gate[i])
+    for (int i = 0; i < q_dim; i++) {
+        float g = 1.0f / (1.0f + expf(-q_out_gate[i]));
+        attn_out[i] *= g;
+    }
+#endif
 
     // ---- Output projection ----
     float *attn_projected = calloc(HIDDEN_DIM, sizeof(float));
@@ -2361,6 +2421,9 @@ static void full_attention_forward(
     free(q);
 #if HAS_ATTN_GATE
     free(q_gate);
+#endif
+#if HAS_ATTN_OUTPUT_GATE
+    free(q_out_gate);
 #endif
     free(k);
     free(v);
@@ -2469,10 +2532,10 @@ static void linear_attention_forward(
     if (qkv_w && qkv_s && qkv_b && z_w && z_s && z_b &&
         b_w && b_s && b_b && a_w && a_s && a_b) {
         BatchMatvecSpec la_specs[4] = {
-            { qkv_w, qkv_s, qkv_b, qkv,   (uint32_t)qkv_dim,         HIDDEN_DIM, GROUP_SIZE, 0, 4 },
-            { z_w,   z_s,   z_b,   z,      (uint32_t)z_dim,           HIDDEN_DIM, GROUP_SIZE, 1, 4 },
-            { b_w,   b_s,   b_b,   beta,   (uint32_t)LINEAR_NUM_V_HEADS, HIDDEN_DIM, GROUP_SIZE, 2, 4 },
-            { a_w,   a_s,   a_b,   alpha,  (uint32_t)LINEAR_NUM_V_HEADS, HIDDEN_DIM, GROUP_SIZE, 3, 4 },
+            { qkv_w, qkv_s, qkv_b, qkv,   (uint32_t)qkv_dim,         HIDDEN_DIM, GROUP_SIZE, 0, BITS },
+            { z_w,   z_s,   z_b,   z,      (uint32_t)z_dim,           HIDDEN_DIM, GROUP_SIZE, 1, BITS },
+            { b_w,   b_s,   b_b,   beta,   (uint32_t)LINEAR_NUM_V_HEADS, HIDDEN_DIM, GROUP_SIZE, 2, BITS },
+            { a_w,   a_s,   a_b,   alpha,  (uint32_t)LINEAR_NUM_V_HEADS, HIDDEN_DIM, GROUP_SIZE, 3, BITS },
         };
         fast_batch_matvec(normed, HIDDEN_DIM, la_specs, 4);
     }
@@ -2534,7 +2597,7 @@ static void linear_attention_forward(
     //     output = sum(state * q, axis=key_dim)         -- read from state
 
     snprintf(name, sizeof(name), "model.layers.%d.linear_attn.A_log", layer_idx);
-    float *A_log = get_tensor_ptr(wf, name);
+    uint16_t *A_log = get_tensor_ptr(wf, name);  /* BF16 */
 
     snprintf(name, sizeof(name), "model.layers.%d.linear_attn.dt_bias", layer_idx);
     uint16_t *dt_bias_bf16 = get_tensor_ptr(wf, name);
@@ -2550,7 +2613,7 @@ static void linear_attention_forward(
         // g = exp(-exp(A_log) * softplus(a + dt_bias))
         float a_val = alpha[vh];
         float dt_b = dt_bias_bf16 ? bf16_to_f32(dt_bias_bf16[vh]) : 0.0f;
-        float A_val = A_log ? expf(A_log[vh]) : 1.0f;
+        float A_val = A_log ? expf(bf16_to_f32(A_log[vh])) : 1.0f;
         float softplus_val = logf(1.0f + expf(a_val + dt_b));  // softplus(a + dt_bias)
         g_decay[vh] = expf(-A_val * softplus_val);
 
@@ -2727,8 +2790,8 @@ static void moe_forward(
         suw && sus && sub && seg_w && seg_s && seg_b) {
         BatchMatvecSpec moe_specs[4] = {
             { gate_w, gate_s, gate_b, gate_scores,        (uint32_t)NUM_EXPERTS,        HIDDEN_DIM, GROUP_SIZE, 0, 8 },
-            { sgw,    sgs,    sgb,    shared_gate,         (uint32_t)SHARED_INTERMEDIATE, HIDDEN_DIM, GROUP_SIZE, 1, 4 },
-            { suw,    sus,    sub,    shared_up,           (uint32_t)SHARED_INTERMEDIATE, HIDDEN_DIM, GROUP_SIZE, 2, 4 },
+            { sgw,    sgs,    sgb,    shared_gate,         (uint32_t)SHARED_INTERMEDIATE, HIDDEN_DIM, GROUP_SIZE, 1, BITS },
+            { suw,    sus,    sub,    shared_up,           (uint32_t)SHARED_INTERMEDIATE, HIDDEN_DIM, GROUP_SIZE, 2, BITS },
             { seg_w,  seg_s,  seg_b,  &shared_gate_score,  1,                            HIDDEN_DIM, GROUP_SIZE, 3, 8 },
         };
         fast_batch_matvec(h_post, HIDDEN_DIM, moe_specs, 4);
@@ -2805,6 +2868,15 @@ static void moe_forward(
                 float *up_proj_out = malloc(MOE_INTERMEDIATE * sizeof(float));
                 float *act_out = malloc(MOE_INTERMEDIATE * sizeof(float));
 
+#if BITS == 8
+                cpu_dequant_matvec_8bit(gw, gs_p, gb_p, h_post, gate_proj_out,
+                                        MOE_INTERMEDIATE, HIDDEN_DIM, GROUP_SIZE);
+                cpu_dequant_matvec_8bit(uw, us_p, ub_p, h_post, up_proj_out,
+                                        MOE_INTERMEDIATE, HIDDEN_DIM, GROUP_SIZE);
+                cpu_swiglu(gate_proj_out, up_proj_out, act_out, MOE_INTERMEDIATE);
+                cpu_dequant_matvec_8bit(dw, ds_p, db_p, act_out, expert_out,
+                                        HIDDEN_DIM, MOE_INTERMEDIATE, GROUP_SIZE);
+#else
                 cpu_dequant_matvec(gw, gs_p, gb_p, h_post, gate_proj_out,
                                    MOE_INTERMEDIATE, HIDDEN_DIM, GROUP_SIZE);
                 cpu_dequant_matvec(uw, us_p, ub_p, h_post, up_proj_out,
@@ -2812,6 +2884,7 @@ static void moe_forward(
                 cpu_swiglu(gate_proj_out, up_proj_out, act_out, MOE_INTERMEDIATE);
                 cpu_dequant_matvec(dw, ds_p, db_p, act_out, expert_out,
                                    HIDDEN_DIM, MOE_INTERMEDIATE, GROUP_SIZE);
+#endif
 
                 free(gate_proj_out);
                 free(up_proj_out);
@@ -2894,15 +2967,10 @@ static void moe_forward(
 }
 
 // ============================================================================
-// Embedding lookup (4-bit quantized)
+// Embedding lookup (4-bit or 8-bit quantized, selected by BITS)
 // ============================================================================
 
 static void embed_lookup(WeightFile *wf, int token_id, float *out) {
-    // Embedding: weight[vocab_size, hidden_dim/8] (U32), scales[vocab_size, groups], biases[vocab_size, groups]
-    // For embedding lookup, we just need one row.
-    // But the embedding is quantized: each row has hidden_dim/8 uint32 values (packed 4-bit)
-    // plus scales and biases per group
-
     TensorInfo *w_info = get_tensor_info(wf, "model.embed_tokens.weight");
     TensorInfo *s_info = get_tensor_info(wf, "model.embed_tokens.scales");
     TensorInfo *b_info = get_tensor_info(wf, "model.embed_tokens.biases");
@@ -2913,9 +2981,8 @@ static void embed_lookup(WeightFile *wf, int token_id, float *out) {
         return;
     }
 
-    // w shape: [248320, 512] U32 -> each row has 512 uint32 = 4096 packed 4-bit values
-    int packed_cols = w_info->shape[1];  // 512
-    int num_groups = s_info->shape[1];   // 64
+    int packed_cols = w_info->shape[1];   // HIDDEN_DIM/8 (4-bit) or HIDDEN_DIM/4 (8-bit)
+    int num_groups  = s_info->shape[1];   // HIDDEN_DIM / GROUP_SIZE
 
     uint32_t *W = (uint32_t *)((char *)wf->data + w_info->offset);
     uint16_t *S = (uint16_t *)((char *)wf->data + s_info->offset);
@@ -2925,23 +2992,39 @@ static void embed_lookup(WeightFile *wf, int token_id, float *out) {
     const uint16_t *s_row = S + (size_t)token_id * num_groups;
     const uint16_t *b_row = B + (size_t)token_id * num_groups;
 
-    int group_size = HIDDEN_DIM / num_groups;  // 4096/64 = 64
-    int packed_per_group = group_size / 8;     // 8
+    int group_size = HIDDEN_DIM / num_groups;  // typically GROUP_SIZE = 64
 
+#if BITS == 8
+    // 8-bit: 4 values per uint32
+    int packed_per_group = group_size / 4;
     for (int g = 0; g < num_groups; g++) {
         float scale = bf16_to_f32(s_row[g]);
-        float bias = bf16_to_f32(b_row[g]);
-
+        float bias  = bf16_to_f32(b_row[g]);
+        for (int p = 0; p < packed_per_group; p++) {
+            uint32_t packed = w_row[g * packed_per_group + p];
+            int base = g * group_size + p * 4;
+            out[base + 0] = (float)((packed >>  0) & 0xFF) * scale + bias;
+            out[base + 1] = (float)((packed >>  8) & 0xFF) * scale + bias;
+            out[base + 2] = (float)((packed >> 16) & 0xFF) * scale + bias;
+            out[base + 3] = (float)((packed >> 24) & 0xFF) * scale + bias;
+        }
+    }
+#else
+    // 4-bit: 8 values per uint32
+    int packed_per_group = group_size / 8;
+    for (int g = 0; g < num_groups; g++) {
+        float scale = bf16_to_f32(s_row[g]);
+        float bias  = bf16_to_f32(b_row[g]);
         for (int p = 0; p < packed_per_group; p++) {
             uint32_t packed = w_row[g * packed_per_group + p];
             int base = g * group_size + p * 8;
-
             for (int n = 0; n < 8; n++) {
                 uint32_t nibble = (packed >> (n * 4)) & 0xF;
                 out[base + n] = (float)nibble * scale + bias;
             }
         }
     }
+#endif
 }
 
 // ============================================================================
@@ -3702,7 +3785,7 @@ typedef struct {
     uint32_t *b_w;   uint16_t *b_s, *b_b;
     uint32_t *a_w;   uint16_t *a_s, *a_b;
     uint16_t *conv1d_w;
-    float *A_log;
+    uint16_t *A_log;    /* BF16 in safetensors */
     uint16_t *dt_bias;
     uint16_t *gated_norm_w;
     uint32_t *out_proj_w; uint16_t *out_proj_s, *out_proj_b;
@@ -4006,7 +4089,7 @@ static float *s_q_proj_out = NULL;  // [Q_PROJ_DIM]
 static float *s_k_proj_out = NULL;  // [NUM_KV_HEADS * HEAD_DIM]
 static float *s_v_proj_out = NULL;  // [NUM_KV_HEADS * HEAD_DIM]
 static float *s_q         = NULL;   // [NUM_ATTN_HEADS * HEAD_DIM]
-#if HAS_ATTN_GATE
+#if HAS_ATTN_GATE || HAS_ATTN_OUTPUT_GATE
 static float *s_q_gate    = NULL;   // [NUM_ATTN_HEADS * HEAD_DIM]
 #endif
 static float *s_attn_out  = NULL;   // [NUM_ATTN_HEADS * HEAD_DIM]
@@ -4040,7 +4123,7 @@ static void init_layer_scratch(void) {
     s_k_proj_out = calloc(NUM_KV_HEADS * HEAD_DIM, sizeof(float));
     s_v_proj_out = calloc(NUM_KV_HEADS * HEAD_DIM, sizeof(float));
     s_q          = calloc(NUM_ATTN_HEADS * HEAD_DIM, sizeof(float));
-#if HAS_ATTN_GATE
+#if HAS_ATTN_GATE || HAS_ATTN_OUTPUT_GATE
     s_q_gate     = calloc(NUM_ATTN_HEADS * HEAD_DIM, sizeof(float));
 #endif
     s_attn_out   = calloc(NUM_ATTN_HEADS * HEAD_DIM, sizeof(float));
@@ -4070,6 +4153,21 @@ static void fused_layer_forward(
     if (g_timing_enabled) { t_layer_start = now_ms(); }
     int pred_started = 0;  // set to 1 if we started prediction preads during CMD1_wait
 
+    // Debug: print hidden state at entry of each layer for first few tokens
+    {
+        static int fwd_dbg_count = 0;
+        if (layer_idx == 0) fwd_dbg_count++;
+        // Print ALL layers for the first generation token (fwd_dbg_count==2 = first gen token after prompt)
+        // Also print layers 0-3 for pos 0 and 1
+        if ((pos <= 1 && (layer_idx <= 3 || layer_idx == 39)) || (fwd_dbg_count == 2)) {
+            float h_rms = 0.0f;
+            for (int _i = 0; _i < HIDDEN_DIM; _i++) h_rms += hidden[_i] * hidden[_i];
+            h_rms = sqrtf(h_rms / HIDDEN_DIM);
+            fprintf(stderr, "[FWD-DBG] tok=%d layer=%d pos=%d hidden_rms=%.6f h0=%.6f\n",
+                    fwd_dbg_count, layer_idx, pos, h_rms, hidden[0]);
+        }
+    }
+
     init_layer_scratch();
     if (!layer_cache_built) build_layer_cache(wf);
     LayerWeightCache *lc = &layer_cache[layer_idx];
@@ -4097,9 +4195,9 @@ static void fused_layer_forward(
 
         if (lc->q_w && lc->q_s && lc->q_b && lc->k_w && lc->k_s && lc->k_b &&
             lc->v_w && lc->v_s && lc->v_b) {
-            attn_specs[0] = (BatchMatvecSpec){ lc->q_w, lc->q_s, lc->q_b, q_proj_out, (uint32_t)q_proj_dim, HIDDEN_DIM, GROUP_SIZE, 0, 4 };
-            attn_specs[1] = (BatchMatvecSpec){ lc->k_w, lc->k_s, lc->k_b, k_out,      (uint32_t)kv_dim,     HIDDEN_DIM, GROUP_SIZE, 1, 4 };
-            attn_specs[2] = (BatchMatvecSpec){ lc->v_w, lc->v_s, lc->v_b, v_out,      (uint32_t)kv_dim,     HIDDEN_DIM, GROUP_SIZE, 2, 4 };
+            attn_specs[0] = (BatchMatvecSpec){ lc->q_w, lc->q_s, lc->q_b, q_proj_out, (uint32_t)q_proj_dim, HIDDEN_DIM, GROUP_SIZE, 0, BITS };
+            attn_specs[1] = (BatchMatvecSpec){ lc->k_w, lc->k_s, lc->k_b, k_out,      (uint32_t)kv_dim,     HIDDEN_DIM, GROUP_SIZE, 1, BITS };
+            attn_specs[2] = (BatchMatvecSpec){ lc->v_w, lc->v_s, lc->v_b, v_out,      (uint32_t)kv_dim,     HIDDEN_DIM, GROUP_SIZE, 2, BITS };
             num_attn_specs = 3;
         }
     }
@@ -4115,10 +4213,10 @@ static void fused_layer_forward(
 
         if (lc->qkv_w && lc->qkv_s && lc->qkv_b && lc->z_w && lc->z_s && lc->z_b &&
             lc->b_w && lc->b_s && lc->b_b && lc->a_w && lc->a_s && lc->a_b) {
-            attn_specs[0] = (BatchMatvecSpec){ lc->qkv_w, lc->qkv_s, lc->qkv_b, qkv_out,   (uint32_t)qkv_dim,            HIDDEN_DIM, GROUP_SIZE, 0, 4 };
-            attn_specs[1] = (BatchMatvecSpec){ lc->z_w,   lc->z_s,   lc->z_b,   z_out,      (uint32_t)z_dim,              HIDDEN_DIM, GROUP_SIZE, 1, 4 };
-            attn_specs[2] = (BatchMatvecSpec){ lc->b_w,   lc->b_s,   lc->b_b,   beta_out,   (uint32_t)LINEAR_NUM_V_HEADS, HIDDEN_DIM, GROUP_SIZE, 2, 4 };
-            attn_specs[3] = (BatchMatvecSpec){ lc->a_w,   lc->a_s,   lc->a_b,   alpha_out,  (uint32_t)LINEAR_NUM_V_HEADS, HIDDEN_DIM, GROUP_SIZE, 3, 4 };
+            attn_specs[0] = (BatchMatvecSpec){ lc->qkv_w, lc->qkv_s, lc->qkv_b, qkv_out,   (uint32_t)qkv_dim,            HIDDEN_DIM, GROUP_SIZE, 0, BITS };
+            attn_specs[1] = (BatchMatvecSpec){ lc->z_w,   lc->z_s,   lc->z_b,   z_out,      (uint32_t)z_dim,              HIDDEN_DIM, GROUP_SIZE, 1, BITS };
+            attn_specs[2] = (BatchMatvecSpec){ lc->b_w,   lc->b_s,   lc->b_b,   beta_out,   (uint32_t)LINEAR_NUM_V_HEADS, HIDDEN_DIM, GROUP_SIZE, 2, BITS };
+            attn_specs[3] = (BatchMatvecSpec){ lc->a_w,   lc->a_s,   lc->a_b,   alpha_out,  (uint32_t)LINEAR_NUM_V_HEADS, HIDDEN_DIM, GROUP_SIZE, 3, BITS };
             num_attn_specs = 4;
         }
     }
@@ -4575,6 +4673,17 @@ static void fused_layer_forward(
             memcpy(q + h * HEAD_DIM, src, HEAD_DIM * sizeof(float));
             memcpy(q_gate + h * HEAD_DIM, src + HEAD_DIM, HEAD_DIM * sizeof(float));
         }
+#elif HAS_ATTN_OUTPUT_GATE
+        // Qwen3.6: q_proj output is [num_heads, head_dim * 2] — per-head
+        // interleaved: first HEAD_DIM elements per head are the queries, next
+        // HEAD_DIM are the per-element sigmoid gate logits.  (Matches HF
+        // Qwen3NextAttention.forward: q_proj.view(..., head_dim*2).chunk(2, dim=-1).)
+        float *q_gate = s_q_gate;
+        for (int h = 0; h < NUM_ATTN_HEADS; h++) {
+            float *src = q_proj_out + h * (2 * HEAD_DIM);
+            memcpy(q + h * HEAD_DIM, src, HEAD_DIM * sizeof(float));
+            memcpy(q_gate + h * HEAD_DIM, src + HEAD_DIM, HEAD_DIM * sizeof(float));
+        }
 #else
         memcpy(q, q_proj_out, q_dim * sizeof(float));
 #endif
@@ -4633,7 +4742,7 @@ static void fused_layer_forward(
         if (gpu_attn_ready) {
             // Copy Q to GPU; attention dispatches will be in CMD2
             memcpy([g_metal->buf_attn_q contents], q, q_dim * sizeof(float));
-#if HAS_ATTN_GATE
+#if HAS_ATTN_GATE || HAS_ATTN_OUTPUT_GATE
             memcpy([g_metal->buf_attn_gate contents], q_gate, q_dim * sizeof(float));
 #endif
             // attn_out_for_oproj will be set to NULL below — CMD2 reads buf_attn_out
@@ -4657,7 +4766,7 @@ static void fused_layer_forward(
                 }
                 free(scores);
             }
-#if HAS_ATTN_GATE
+#if HAS_ATTN_GATE || HAS_ATTN_OUTPUT_GATE
             for (int i = 0; i < q_dim; i++) {
                 float g = 1.0f / (1.0f + expf(-q_gate[i]));
                 attn_out[i] *= g;
@@ -4718,22 +4827,42 @@ static void fused_layer_forward(
             }
 
             // Gated delta net recurrence
-            float *A_log = lc->A_log;
+            uint16_t *A_log = lc->A_log;  /* BF16 */
             uint16_t *dt_bias_bf16 = lc->dt_bias;
 
             float *out_values = s_out_vals;
             memset(out_values, 0, LINEAR_TOTAL_VALUE * sizeof(float));
             int k_heads_per_v = LINEAR_NUM_V_HEADS / LINEAR_NUM_K_HEADS;
 
+            // CPU linear debug for layer 0 at pos 0
+            if (layer_idx == 0 && pos == 0) {
+                float qkv_rms = 0.0f, conv_rms = 0.0f;
+                for (int _i = 0; _i < qkv_dim; _i++) { qkv_rms += qkv_out[_i]*qkv_out[_i]; conv_rms += conv_out[_i]*conv_out[_i]; }
+                fprintf(stderr, "[LIN-DBG] qkv_rms=%.6f conv_rms=%.6f z_rms=%.6f alpha[0]=%.6f beta[0]=%.6f\n",
+                        sqrtf(qkv_rms/qkv_dim), sqrtf(conv_rms/qkv_dim),
+                        z_out ? sqrtf(z_out[0]*z_out[0]) : -1.f, alpha_out ? alpha_out[0] : -999.f, beta_out ? beta_out[0] : -999.f);
+                fprintf(stderr, "[LIN-DBG-V] qkv[0..4]=%.4f %.4f %.4f %.4f %.4f\n",
+                        qkv_out[0], qkv_out[1], qkv_out[2], qkv_out[3], qkv_out[4]);
+                fprintf(stderr, "[LIN-DBG-V] conv[0..4]=%.4f %.4f %.4f %.4f %.4f\n",
+                        conv_out[0], conv_out[1], conv_out[2], conv_out[3], conv_out[4]);
+            }
+
             float g_decay[LINEAR_NUM_V_HEADS];
             float beta_gate_arr[LINEAR_NUM_V_HEADS];
             for (int vh = 0; vh < LINEAR_NUM_V_HEADS; vh++) {
                 float a_val = alpha_out[vh];
                 float dt_b = dt_bias_bf16 ? bf16_to_f32(dt_bias_bf16[vh]) : 0.0f;
-                float A_val = A_log ? expf(A_log[vh]) : 1.0f;
+                float A_val = A_log ? expf(bf16_to_f32(A_log[vh])) : 1.0f;
                 float softplus_val = logf(1.0f + expf(a_val + dt_b));
                 g_decay[vh] = expf(-A_val * softplus_val);
                 beta_gate_arr[vh] = cpu_sigmoid(beta_out[vh]);
+            }
+            if (layer_idx == 0 && pos == 0) {
+                fprintf(stderr, "[LIN-DBG2] A_val[0]=%.6f dt_b[0]=%.6f alpha_out[0]=%.6f g_decay[0]=%.6f beta[0]=%.6f\n",
+                        A_log ? expf(bf16_to_f32(A_log[0])) : -1.f,
+                        dt_bias_bf16 ? bf16_to_f32(dt_bias_bf16[0]) : -1.f,
+                        alpha_out ? alpha_out[0] : -999.f,
+                        g_decay[0], beta_gate_arr[0]);
             }
 
             // Compute linear_layer_idx: count of non-full-attention layers before this one.
@@ -4832,6 +4961,15 @@ static void fused_layer_forward(
 
             attn_out_for_oproj = gated_out;
 
+            // Debug gated_out after linear attention
+            if (layer_idx == 0 && pos == 0) {
+                float ov_rms = 0.0f, go_rms = 0.0f;
+                for (int _i = 0; _i < LINEAR_TOTAL_VALUE; _i++) { ov_rms += out_values[_i]*out_values[_i]; go_rms += gated_out[_i]*gated_out[_i]; }
+                fprintf(stderr, "[LIN-DBG3] out_values_rms=%.6f gated_out_rms=%.6f gated_norm_w=%s\n",
+                        sqrtf(ov_rms/LINEAR_TOTAL_VALUE), sqrtf(go_rms/LINEAR_TOTAL_VALUE),
+                        lc->gated_norm_w ? "present" : "NULL");
+            }
+
             // conv_out, out_values are static — no free needed
             // gated_out is static — freed/released after CMD2 submission below
         }
@@ -4849,6 +4987,20 @@ static void fused_layer_forward(
     // =====================================================================
 
     if (g_timing_enabled) { t1 = now_ms(); g_timing.cpu_attn += t1 - t0; }
+
+    // --- Mid-layer debug: print attn output rms before CMD2 ---
+    if (layer_idx <= 3 && pos == 0) {
+        float a_rms = 0.0f;
+        if (attn_out_for_oproj) {
+            for (int _i = 0; _i < oproj_in_dim && _i < 4096; _i++) a_rms += attn_out_for_oproj[_i] * attn_out_for_oproj[_i];
+            a_rms = sqrtf(a_rms / (oproj_in_dim < 4096 ? oproj_in_dim : 4096));
+        }
+        float n_rms = 0.0f;
+        for (int _i = 0; _i < HIDDEN_DIM; _i++) n_rms += normed[_i] * normed[_i];
+        n_rms = sqrtf(n_rms / HIDDEN_DIM);
+        fprintf(stderr, "[MID-DBG] layer=%d normed_rms=%.6f attn_out_rms=%.6f oproj_in_dim=%d gpu_linear=%d\n",
+                layer_idx, n_rms, a_rms, oproj_in_dim, gpu_linear_attn);
+    }
 
     // Wait for speculative expert I/O to complete (overlapped with CPU attention)
     if (spec_group) {
@@ -4976,8 +5128,8 @@ static void fused_layer_forward(
                     threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
                 [enc endEncoding];
             }
-#if HAS_ATTN_GATE
-            // Enc A4: sigmoid_gate
+#if HAS_ATTN_GATE || HAS_ATTN_OUTPUT_GATE
+            // Enc A4: sigmoid_gate (attn_out[i] *= sigmoid(gate[i]))
             {
                 uint32_t qdim = NUM_ATTN_HEADS * HEAD_DIM;
                 id<MTLComputeCommandEncoder> enc = [cmd_fused computeCommandEncoder];
@@ -5007,6 +5159,20 @@ static void fused_layer_forward(
             uint32_t o_out_dim = HIDDEN_DIM;
             uint32_t o_in_dim = (uint32_t)oproj_in_dim;
             uint32_t o_gs = GROUP_SIZE;
+#if BITS == 8
+            [enc setComputePipelineState:g_metal->matvec_8bit];
+            uint32_t o_num_tgs = (o_out_dim + 7) / 8;
+            [enc setBuffer:g_metal->wf_buf  offset:w_off atIndex:0];
+            [enc setBuffer:g_metal->wf_buf  offset:s_off atIndex:1];
+            [enc setBuffer:g_metal->wf_buf  offset:b_off atIndex:2];
+            [enc setBuffer:oproj_input      offset:0    atIndex:3];
+            [enc setBuffer:g_metal->buf_output offset:0 atIndex:4];
+            [enc setBytes:&o_out_dim  length:4 atIndex:5];
+            [enc setBytes:&o_in_dim   length:4 atIndex:6];
+            [enc setBytes:&o_gs       length:4 atIndex:7];
+            [enc dispatchThreadgroups:MTLSizeMake(o_num_tgs, 1, 1)
+                threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+#else
             [enc setComputePipelineState:g_metal->matvec_fast];
             [enc setBuffer:g_metal->wf_buf  offset:w_off atIndex:0];
             [enc setBuffer:g_metal->wf_buf  offset:s_off atIndex:1];
@@ -5018,6 +5184,7 @@ static void fused_layer_forward(
             [enc setBytes:&o_gs       length:4 atIndex:7];
             [enc dispatchThreadgroups:MTLSizeMake(o_out_dim, 1, 1)
                 threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+#endif
             [enc endEncoding];
         }
 
@@ -5073,8 +5240,8 @@ static void fused_layer_forward(
 #if HAS_SHARED_EXPERT
         BatchMatvecSpec moe_specs[4] = {
             { gate_w, gate_s, gate_b, gate_scores,        (uint32_t)NUM_EXPERTS,        HIDDEN_DIM, GROUP_SIZE, 0, 8 },
-            { sgw,    sgs,    sgb,    shared_gate,         (uint32_t)SHARED_INTERMEDIATE, HIDDEN_DIM, GROUP_SIZE, 1, 4 },
-            { suw,    sus,    sub,    shared_up,           (uint32_t)SHARED_INTERMEDIATE, HIDDEN_DIM, GROUP_SIZE, 2, 4 },
+            { sgw,    sgs,    sgb,    shared_gate,         (uint32_t)SHARED_INTERMEDIATE, HIDDEN_DIM, GROUP_SIZE, 1, BITS },
+            { suw,    sus,    sub,    shared_up,           (uint32_t)SHARED_INTERMEDIATE, HIDDEN_DIM, GROUP_SIZE, 2, BITS },
             { seg_w,  seg_s,  seg_b,  &shared_gate_score,  1,                            HIDDEN_DIM, GROUP_SIZE, 3, 8 },
         };
         int num_moe_specs = 4;
@@ -5104,6 +5271,16 @@ static void fused_layer_forward(
         memcpy(hidden, h_mid, HIDDEN_DIM * sizeof(float));
         if (g_timing_enabled) { t1 = now_ms(); g_timing.cmd2_wait += t1 - t0; }
 
+        // --- Post-CMD2 debug ---
+        if (layer_idx <= 3 && pos == 0) {
+            float hm_rms = 0.0f, hp_rms = 0.0f;
+            for (int _i = 0; _i < HIDDEN_DIM; _i++) hm_rms += h_mid[_i] * h_mid[_i];
+            for (int _i = 0; _i < HIDDEN_DIM; _i++) hp_rms += h_post[_i] * h_post[_i];
+            fprintf(stderr, "[CMD2-DBG] layer=%d h_mid_rms=%.6f h_post_rms=%.6f hidden_rms=%.6f\n",
+                    layer_idx, sqrtf(hm_rms/HIDDEN_DIM), sqrtf(hp_rms/HIDDEN_DIM),
+                    sqrtf(hm_rms/HIDDEN_DIM));
+        }
+
     } else {
         // ---- Non-fused fallback path ----
         // O projection
@@ -5130,8 +5307,8 @@ static void fused_layer_forward(
 #if HAS_SHARED_EXPERT
             BatchMatvecSpec moe_specs[4] = {
                 { gate_w, gate_s, gate_b, gate_scores,        (uint32_t)NUM_EXPERTS,        HIDDEN_DIM, GROUP_SIZE, 0, 8 },
-                { sgw,    sgs,    sgb,    shared_gate,         (uint32_t)SHARED_INTERMEDIATE, HIDDEN_DIM, GROUP_SIZE, 1, 4 },
-                { suw,    sus,    sub,    shared_up,           (uint32_t)SHARED_INTERMEDIATE, HIDDEN_DIM, GROUP_SIZE, 2, 4 },
+                { sgw,    sgs,    sgb,    shared_gate,         (uint32_t)SHARED_INTERMEDIATE, HIDDEN_DIM, GROUP_SIZE, 1, BITS },
+                { suw,    sus,    sub,    shared_up,           (uint32_t)SHARED_INTERMEDIATE, HIDDEN_DIM, GROUP_SIZE, 2, BITS },
                 { seg_w,  seg_s,  seg_b,  &shared_gate_score,  1,                            HIDDEN_DIM, GROUP_SIZE, 3, 8 },
             };
             fast_batch_matvec(h_post, HIDDEN_DIM, moe_specs, 4);
@@ -5622,6 +5799,15 @@ static void fused_layer_forward(
             float *up_proj_out = malloc(MOE_INTERMEDIATE * sizeof(float));
             float *act_out = malloc(MOE_INTERMEDIATE * sizeof(float));
 
+#if BITS == 8
+            cpu_dequant_matvec_8bit(gw, gs_p, gb_p, h_post, gate_proj_out,
+                                    MOE_INTERMEDIATE, HIDDEN_DIM, GROUP_SIZE);
+            cpu_dequant_matvec_8bit(uw, us_p, ub_p, h_post, up_proj_out,
+                                    MOE_INTERMEDIATE, HIDDEN_DIM, GROUP_SIZE);
+            cpu_swiglu(gate_proj_out, up_proj_out, act_out, MOE_INTERMEDIATE);
+            cpu_dequant_matvec_8bit(dw, ds_p, db_p, act_out, expert_out_cpu,
+                                    HIDDEN_DIM, MOE_INTERMEDIATE, GROUP_SIZE);
+#else
             cpu_dequant_matvec(gw, gs_p, gb_p, h_post, gate_proj_out,
                                MOE_INTERMEDIATE, HIDDEN_DIM, GROUP_SIZE);
             cpu_dequant_matvec(uw, us_p, ub_p, h_post, up_proj_out,
@@ -5629,6 +5815,7 @@ static void fused_layer_forward(
             cpu_swiglu(gate_proj_out, up_proj_out, act_out, MOE_INTERMEDIATE);
             cpu_dequant_matvec(dw, ds_p, db_p, act_out, expert_out_cpu,
                                HIDDEN_DIM, MOE_INTERMEDIATE, GROUP_SIZE);
+#endif
 
             free(gate_proj_out);
             free(up_proj_out);
@@ -5644,8 +5831,13 @@ static void fused_layer_forward(
         float *shared_act = calloc(SHARED_INTERMEDIATE, sizeof(float));
         cpu_swiglu(shared_gate, shared_up, shared_act, SHARED_INTERMEDIATE);
         if (sdw && sds && sdb) {
+#if BITS == 8
+            cpu_dequant_matvec_8bit(sdw, sds, sdb, shared_act, shared_out,
+                                    HIDDEN_DIM, SHARED_INTERMEDIATE, GROUP_SIZE);
+#else
             cpu_dequant_matvec(sdw, sds, sdb, shared_act, shared_out,
                                HIDDEN_DIM, SHARED_INTERMEDIATE, GROUP_SIZE);
+#endif
         }
         free(shared_act);
 #endif
@@ -7236,6 +7428,7 @@ int main(int argc, char **argv) {
         const char *vocab_path = NULL;
         const char *prompt_tokens_path = NULL;
         const char *prompt_text = NULL;
+        int use_chat_template = 0;
         int max_tokens = 20;
         int K = 4;
         int cache_entries = 0;  // default 0: trust OS page cache (38% faster than Metal LRU)
@@ -7249,6 +7442,7 @@ int main(int argc, char **argv) {
             {"vocab",         required_argument, 0, 'v'},
             {"prompt-tokens", required_argument, 0, 'p'},
             {"prompt",        required_argument, 0, 'P'},
+            {"chat",          no_argument,       0, 'Q'},
             {"tokens",        required_argument, 0, 't'},
             {"k",             required_argument, 0, 'k'},
             {"cache-entries",  required_argument, 0, 'C'},
@@ -7269,7 +7463,7 @@ int main(int argc, char **argv) {
         };
 
         int c;
-        while ((c = getopt_long(argc, argv, "m:w:j:v:p:P:t:k:C:M:R:B:LSTFE2Gh", long_options, NULL)) != -1) {
+        while ((c = getopt_long(argc, argv, "m:w:j:v:p:P:t:k:C:M:R:B:LSTFE2GQh", long_options, NULL)) != -1) {
             switch (c) {
                 case 'm': model_path = optarg; break;
                 case 'w': weights_path = optarg; break;
@@ -7277,6 +7471,7 @@ int main(int argc, char **argv) {
                 case 'v': vocab_path = optarg; break;
                 case 'p': prompt_tokens_path = optarg; break;
                 case 'P': prompt_text = optarg; break;
+                case 'Q': use_chat_template = 1; break;
                 case 't': max_tokens = atoi(optarg); break;
                 case 'k': K = atoi(optarg); break;
                 case 'C': cache_entries = atoi(optarg); break;
@@ -7397,9 +7592,13 @@ int main(int argc, char **argv) {
         PromptTokens *pt = NULL;
         if (serve_port == 0) {
             if (prompt_text) {
-                pt = encode_prompt_text_to_tokens(prompt_text);
+                if (use_chat_template) {
+                    pt = tokenize_chat_message(prompt_text);
+                } else {
+                    pt = encode_prompt_text_to_tokens(prompt_text);
+                }
                 if (!pt) {
-                    fprintf(stderr, "ERROR: Failed to encode prompt. Make sure encode_prompt.py exists.\n");
+                    fprintf(stderr, "ERROR: Failed to encode prompt.\n");
                     return 1;
                 }
             } else if (!prompt_tokens_path) {
@@ -7671,11 +7870,21 @@ int main(int argc, char **argv) {
         if (embed_batch) { free(embed_batch); embed_batch = NULL; }
 
         // ---- Final norm ----
+        // DUMP: save pre-final-norm hidden state for debugging
+        {
+            FILE *dumpf = fopen("/tmp/hidden_before_norm.bin", "wb");
+            if (dumpf) { fwrite(hidden, sizeof(float), HIDDEN_DIM, dumpf); fclose(dumpf); }
+        }
         if (final_norm_w) {
             float *normed = malloc(HIDDEN_DIM * sizeof(float));
             cpu_rms_norm(hidden, final_norm_w, normed, HIDDEN_DIM, RMS_NORM_EPS);
             memcpy(hidden, normed, HIDDEN_DIM * sizeof(float));
             free(normed);
+        }
+        // DUMP: save post-final-norm hidden state for debugging
+        {
+            FILE *dumpf = fopen("/tmp/hidden_after_norm.bin", "wb");
+            if (dumpf) { fwrite(hidden, sizeof(float), HIDDEN_DIM, dumpf); fclose(dumpf); }
         }
 
         // ---- LM head ----
@@ -7767,6 +7976,22 @@ int main(int argc, char **argv) {
 
             // Greedy sample
             next_token = cpu_argmax(logits, VOCAB_SIZE);
+
+            // Debug: show top-5 for first 2 generation tokens
+            if (gen <= 2) {
+                int top5g[5] = {0,0,0,0,0};
+                float topvg[5] = {-1e30f,-1e30f,-1e30f,-1e30f,-1e30f};
+                for (int ii = 0; ii < VOCAB_SIZE; ii++) {
+                    int mk = 0;
+                    for (int kk = 1; kk < 5; kk++) if (topvg[kk] < topvg[mk]) mk = kk;
+                    if (logits[ii] > topvg[mk]) { topvg[mk] = logits[ii]; top5g[mk] = ii; }
+                }
+                fprintf(stderr, "[GEN-DBG] gen=%d next=%d hidden_rms=%.4f logits_rms=%.4f\n",
+                        gen, next_token, vec_rms(hidden, HIDDEN_DIM), vec_rms(logits, VOCAB_SIZE));
+                for (int ii = 0; ii < 5; ii++)
+                    fprintf(stderr, "  token %d (\"%s\") logit=%.4f\n",
+                            top5g[ii], decode_token(vocab, top5g[ii]), topvg[ii]);
+            }
 
             // Think budget: force end thinking if over budget
             if (in_think && g_think_budget > 0 && think_tokens >= g_think_budget) {

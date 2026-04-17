@@ -22,6 +22,8 @@ LDFLAGS = -lpthread -lcompression
 # Model selection via MODEL= variable
 ifeq ($(MODEL),qwen3-coder)
   MODEL_FLAG = -DMODEL_QWEN3_CODER_480B
+else ifeq ($(MODEL),qwen3.6-35b-a3b)
+  MODEL_FLAG = -DMODEL_QWEN36_35B_A3B
 else
   MODEL_FLAG =
 endif
