@@ -131,10 +131,12 @@ per-layer commit+wait overhead predicted in the research doc.
 The fusion is per-layer — on full-attention layers and on layer 0 of each
 token (SLOW PATH) it's automatically bypassed.
 
-## Worktree
+## Worktree & commit
 
 Branch: `worktree-agent-af56a28a`
+Commit: **e64bcd9** (Task #20: fuse CMD1+CMD2 on linear-attn layers)
 Worktree: `/Users/retry/Documents/code/flash-moe/.claude/worktrees/agent-af56a28a`
 
+Based on `129a25e` on main (pipeline guard audit, vDSP+BLAS opt already applied).
 Not committed to main. Main's 35B `model_weights.bin` and `packed_experts/`
 are symlinked, not copied (as instructed).
