@@ -6518,6 +6518,7 @@ static void print_usage(const char *prog) {
     printf("  --collect-routing F  Log routing data to binary file F (for predictor training)\n");
     printf("  --think-budget N     Max thinking tokens before force </think> (default: 2048, 0=unlimited)\n");
     printf("  --serve PORT         Run HTTP server (OpenAI-compatible API)\n");
+    printf("  --prefill-batch N    Batched prefill width (default: 1 = serial; 8/32/64 typical)\n");
     printf("  --help               This message\n");
 }
 
@@ -6534,6 +6535,7 @@ int main(int argc, char **argv) {
         int cache_entries = 0;  // default 0: trust OS page cache (38% faster than Metal LRU)
         int malloc_cache_entries = 0;  // 0 = disabled (override with --malloc-cache)
         int serve_port = 0;  // 0 = disabled, >0 = HTTP serve mode
+        int prefill_batch = 1;  // Task #19: batched prefill width. 1 = serial (bit-identical to previous behavior).
 
         static struct option long_options[] = {
             {"model",         required_argument, 0, 'm'},
@@ -6557,12 +6559,13 @@ int main(int argc, char **argv) {
             {"serve",         required_argument, 0, 'R'},
             {"predict",       no_argument,       0, 'D'},
             {"collect-routing", required_argument, 0, 'Z'},
+            {"prefill-batch", required_argument, 0, 'N'},  // Task #19: batched prefill width
             {"help",          no_argument,       0, 'h'},
             {0, 0, 0, 0}
         };
 
         int c;
-        while ((c = getopt_long(argc, argv, "m:w:j:v:p:P:t:k:C:M:R:B:LSTFE2Gh", long_options, NULL)) != -1) {
+        while ((c = getopt_long(argc, argv, "m:w:j:v:p:P:t:k:C:M:R:B:N:LSTFE2Gh", long_options, NULL)) != -1) {
             switch (c) {
                 case 'm': model_path = optarg; break;
                 case 'w': weights_path = optarg; break;
@@ -6591,6 +6594,16 @@ int main(int argc, char **argv) {
                     break;
                 case 'B': g_think_budget = atoi(optarg); break;
                 case 'R': serve_port = atoi(optarg); break;
+                case 'N':
+                    // Task #19: --prefill-batch N. N=1 is bit-identical serial path.
+                    // N>1 activates the batched prefill scaffolding (see prefill loop below).
+                    prefill_batch = atoi(optarg);
+                    if (prefill_batch < 1) prefill_batch = 1;
+                    if (prefill_batch > 128) {
+                        fprintf(stderr, "WARN: --prefill-batch > 128 clamped to 128 (M1 Pro activation-memory guard)\n");
+                        prefill_batch = 128;
+                    }
+                    break;
                 case 'h': print_usage(argv[0]); return 0;
                 default:  print_usage(argv[0]); return 1;
             }
@@ -6896,37 +6909,66 @@ int main(int argc, char **argv) {
         // This is safe because the hidden state from intermediate prefill tokens
         // is immediately overwritten by the next token's embedding — the recurrent
         // state (KV cache, delta-net state) is already updated inside fused_layer_forward.
+        //
+        // Task #19: --prefill-batch N extends this with a batched-window path.
+        //   N=1  → exact serial loop (bit-identical to prior behavior, default)
+        //   N>1  → process tokens in windows of N, still per-token inside the window
+        //          (MVP scaffold; kernels remain per-token). Future work: batched
+        //          attention + expert-group GEMM inside each window. See
+        //          docs-research/batched-prefill-research.md §2-§4.
+        //
+        // The window boundary is where future batched kernels will amortize:
+        //   - QKV projection: B queries against same weights (GEMV → GEMM)
+        //   - Full-attn scores: B × KV matmul with shared K/V loads
+        //   - Expert dequant+forward: each active expert runs B tokens in one pass
+        // GatedDeltaNet recurrence stays serial inside the window (state-carrying).
         if (pt->count > 1) {
             double t_prefill_batch = now_ms();
             double first_tok_ms = 0;
+            int batch_w = prefill_batch > 0 ? prefill_batch : 1;
+            if (batch_w > pt->count - 1) batch_w = pt->count - 1;
+            if (batch_w < 1) batch_w = 1;
 
-            for (int token_idx = 0; token_idx < pt->count - 1; token_idx++) {
-                double t_tok = now_ms();
+            printf("  [prefill] mode=%s window=%d\n",
+                   batch_w == 1 ? "serial" : "batched-window",
+                   batch_w);
 
-                // Load pre-embedded token from batch buffer
-                cache_telemetry_note_token();
-                memcpy(hidden, embed_batch + (size_t)token_idx * HIDDEN_DIM,
-                       HIDDEN_DIM * sizeof(float));
+            int token_idx = 0;
+            while (token_idx < pt->count - 1) {
+                int window = pt->count - 1 - token_idx;
+                if (window > batch_w) window = batch_w;
 
-                // Run through all 60 transformer layers
-                for (int layer = 0; layer < NUM_LAYERS; layer++) {
-                    int is_full = ((layer + 1) % FULL_ATTN_INTERVAL == 0);
-                    fused_layer_forward(wf, layer, hidden,
-                                        is_full ? kv_caches[layer] : NULL,
-                                        is_full ? NULL : layer_states[layer],
-                                        pos,
-                                        layer_mmaps[layer] != MAP_FAILED ? layer_mmaps[layer] : NULL,
-                                        K, layer_fds[layer]);
+                // ---- Window begin hook ----
+                // In the future kernel-batched path, we'll hoist here:
+                //   - one QKV-projection GEMM for `window` queries
+                //   - one scores+softmax kernel with batched-Q dims
+                //   - one dequant per active expert (shared across the window)
+                // For now, iterate per token inside the window using the same
+                // fused_layer_forward as the serial path. This keeps outputs
+                // bit-identical to prior behavior at any --prefill-batch value.
+                for (int w = 0; w < window; w++) {
+                    double t_tok = now_ms();
+                    cache_telemetry_note_token();
+                    memcpy(hidden,
+                           embed_batch + (size_t)(token_idx + w) * HIDDEN_DIM,
+                           HIDDEN_DIM * sizeof(float));
+
+                    for (int layer = 0; layer < NUM_LAYERS; layer++) {
+                        int is_full = ((layer + 1) % FULL_ATTN_INTERVAL == 0);
+                        fused_layer_forward(wf, layer, hidden,
+                                            is_full ? kv_caches[layer] : NULL,
+                                            is_full ? NULL : layer_states[layer],
+                                            pos,
+                                            layer_mmaps[layer] != MAP_FAILED ? layer_mmaps[layer] : NULL,
+                                            K, layer_fds[layer]);
+                    }
+                    discard_deferred_experts();
+                    pos++;
+
+                    if (token_idx == 0 && w == 0) first_tok_ms = now_ms() - t_tok;
                 }
-
-                // Discard last layer's expert output — hidden will be overwritten
-                // by the next token's embedding. Only wait for GPU (buffer safety).
-                discard_deferred_experts();
-                pos++;
-
-                if (token_idx == 0) {
-                    first_tok_ms = now_ms() - t_tok;
-                }
+                // ---- Window end hook ----
+                token_idx += window;
             }
 
             double prefill_batch_ms = now_ms() - t_prefill_batch;
