@@ -10,7 +10,7 @@
  *   - Qwen3-Coder-480B-A35B-Instruct-4bit (-DMODEL_QWEN3_CODER_480B)
  *
  * Command buffer optimization (fused_layer_forward):
- *   Per-layer Metal command buffer structure:
+ *   Default per-layer Metal command buffer structure:
  *     CMD1: attention input projections (3-4 dispatches, 1 commit)
  *     CPU:  attention compute (RoPE/softmax/delta-net)
  *     CMD2: o_proj + residual_add + rms_norm + routing + shared gate/up (8 encoders, 1 commit)
@@ -20,7 +20,9 @@
  *     CMD3: all K expert forwards + shared SwiGLU + shared down
  *           + GPU-side combine + residual_add + rms_norm -> buf_input (DEFERRED commit)
  *           Batched encoding: 4 encoders for K experts + 2 shared + 3 combine = 9 total
- *   Total: 3 cmd buffers per layer. CMD3 is submitted async (commit without wait).
+ *   Linear-attn fast path can merge CMD1+CMD2 into one command buffer.
+ *   Total: usually 3 cmd buffers/layer, or 2 when CMD1+CMD2 merge is active.
+ *   CMD3 is submitted async (commit without wait).
  *   GPU-side combine in CMD3: for non-last layers, CMD3 also computes:
  *     moe_combine_residual (weighted sum + residual + shared gate -> hidden)
  *     rms_norm (hidden -> buf_input using NEXT layer's input_norm weights)
@@ -90,6 +92,7 @@ typedef struct {
     double input_norm;       // CPU RMS norm + CMD1 prep
     double cmd1_submit;      // CMD1 encode + commit
     double cmd1_wait;        // CMD1 waitUntilCompleted
+    double cmd12_wait;       // merged CMD1+CMD2 wait (GPU linear-attn path)
     double cpu_attn;         // CPU attention compute (delta-net or full-attn)
     double cmd2_encode;      // CMD2 encode (o_proj + residual + norm + routing)
     double cmd2_wait;        // CMD2 commit + waitUntilCompleted
@@ -99,6 +102,7 @@ typedef struct {
     double cmd3_encode;      // CMD3 encode experts + submit (deferred)
     double total;            // total per-layer time
     int count;               // number of layers timed
+    int cmd12_layers;        // layers that used merged CMD1+CMD2 wait
 } LayerTimingAccum;
 
 static LayerTimingAccum g_timing = {0};
@@ -282,6 +286,7 @@ static void timing_print(void) {
     fprintf(stderr, "  input_norm:     %6.3f\n", g_timing.input_norm / n);
     fprintf(stderr, "  cmd1_submit:    %6.3f\n", g_timing.cmd1_submit / n);
     fprintf(stderr, "  cmd1_wait:      %6.3f\n", g_timing.cmd1_wait / n);
+    fprintf(stderr, "  cmd12_wait:     %6.3f\n", g_timing.cmd12_wait / n);
     fprintf(stderr, "  spec_route:     %6.3f\n", g_timing.spec_route / n);
     fprintf(stderr, "  cpu_attn:       %6.3f\n", g_timing.cpu_attn / n);
     fprintf(stderr, "  cmd2_encode:    %6.3f\n", g_timing.cmd2_encode / n);
@@ -292,12 +297,17 @@ static void timing_print(void) {
     fprintf(stderr, "  total_layer:    %6.3f\n", g_timing.total / n);
     fprintf(stderr, "  sum_phases:     %6.3f\n",
             (g_timing.deferred_wait + g_timing.deferred_cpu + g_timing.input_norm +
-             g_timing.cmd1_submit + g_timing.cmd1_wait + g_timing.spec_route +
+             g_timing.cmd1_submit + g_timing.cmd1_wait + g_timing.cmd12_wait +
+             g_timing.spec_route +
              g_timing.cpu_attn +
              g_timing.cmd2_encode + g_timing.cmd2_wait + g_timing.routing_cpu +
              g_timing.expert_io + g_timing.cmd3_encode) / n);
-    fprintf(stderr, "  cmd_buffers:    %d (3 per layer: CMD1+CMD2+CMD3)\n", n * 3);
-    fprintf(stderr, "  sync_waits:     %d (2 per layer: CMD1+CMD2, CMD3 deferred)\n", n * 2);
+    int cmd_buffers = n * 3 - g_timing.cmd12_layers;  // merged path drops one submit per merged layer
+    int sync_waits = n * 2 - g_timing.cmd12_layers;   // merged path drops one wait per merged layer
+    fprintf(stderr, "  cmd_buffers:    %d (base 3/layer, merged cmd12 layers=%d)\n",
+            cmd_buffers, g_timing.cmd12_layers);
+    fprintf(stderr, "  sync_waits:     %d (base 2/layer, merged cmd12 layers=%d)\n",
+            sync_waits, g_timing.cmd12_layers);
     fprintf(stderr, "  gpu_encoders:   ~%d per layer (CMD1:3-4, CMD2:8-12, CMD3:~10)\n",
             22);  // approximate
     if (g_pred_enabled && g_pred_layers > 0) {
@@ -4240,6 +4250,9 @@ static void fused_layer_forward(
     float *normed = s_normed;
     float *residual = s_residual;
     id<MTLCommandBuffer> cmd1 = nil;
+    id<MTLCommandBuffer> cmd12 = nil;  // merged CMD1+CMD2 path (linear-attn only)
+    int cmd12_merged = 0;
+    int cmd12_residual_from_moe_hidden = 0;  // fast path: residual source is previous layer GPU hidden
     int gpu_linear_attn = 0;  // set to 1 if GPU handles entire linear attention pipeline
 
 #if HAS_LINEAR_ATTENTION
@@ -4260,6 +4273,30 @@ static void fused_layer_forward(
 #else
     int can_gpu_linear = 0;
     (void)can_gpu_linear;
+#endif
+
+    // Merge CMD1+CMD2 only when all CMD2 fused prerequisites are already known.
+    // This keeps fallback behavior unchanged if any fused dependency is unavailable.
+    int can_merge_cmd12_linear = 0;
+#if HAS_LINEAR_ATTENTION
+#if HAS_SHARED_EXPERT
+    can_merge_cmd12_linear = (!is_full && can_gpu_linear &&
+                              lc->out_proj_w && lc->out_proj_s && lc->out_proj_b &&
+                              lc->gate_w && lc->gate_s && lc->gate_b &&
+                              lc->sg_w && lc->sg_s && lc->sg_b &&
+                              lc->su_w && lc->su_s && lc->su_b &&
+                              lc->seg_w && lc->seg_s && lc->seg_b &&
+                              g_metal && g_metal->wf_buf &&
+                              g_metal->residual_add && g_metal->rms_norm_sum &&
+                              g_metal->rms_norm_apply_bf16 && lc->post_attn_norm_w);
+#else
+    can_merge_cmd12_linear = (!is_full && can_gpu_linear &&
+                              lc->out_proj_w && lc->out_proj_s && lc->out_proj_b &&
+                              lc->gate_w && lc->gate_s && lc->gate_b &&
+                              g_metal && g_metal->wf_buf &&
+                              g_metal->residual_add && g_metal->rms_norm_sum &&
+                              g_metal->rms_norm_apply_bf16 && lc->post_attn_norm_w);
+#endif
 #endif
 
     // Check if previous layer's CMD3 already computed combine+residual+norm on GPU.
@@ -4370,36 +4407,50 @@ static void fused_layer_forward(
         }
 #endif /* HAS_LINEAR_ATTENTION */
 
-        [cmd1 commit];
+        if (gpu_linear_attn && can_merge_cmd12_linear) {
+            // Merge linear-attn CMD1 + CMD2 into one command buffer.
+            // Fast-path residual uses previous layer's GPU hidden directly.
+            cmd12 = cmd1;
+            cmd12_merged = 1;
+            cmd12_residual_from_moe_hidden = prev_gpu_combined;
+        } else {
+            [cmd1 commit];
 
-        if (g_timing_enabled) { t1 = now_ms(); g_timing.cmd1_submit += t1 - t0; }
+            if (g_timing_enabled) { t1 = now_ms(); g_timing.cmd1_submit += t1 - t0; }
 
-        // Wait for CMD1 (implies CMD3(N-1) also done, since queue is serial)
-        if (g_timing_enabled) { t0 = now_ms(); }
-        [cmd1 waitUntilCompleted];
-        if (!gpu_linear_attn) {
-            gpu_flush_batch_results(g_metal, attn_specs, num_attn_specs);
+            // Wait for CMD1 (implies CMD3(N-1) also done, since queue is serial)
+            if (g_timing_enabled) { t0 = now_ms(); }
+            [cmd1 waitUntilCompleted];
+            if (!gpu_linear_attn) {
+                gpu_flush_batch_results(g_metal, attn_specs, num_attn_specs);
+            }
+            if (g_timing_enabled) { t1 = now_ms(); g_timing.cmd1_wait += t1 - t0; }
+
+            // Now CMD3(N-1) is done. Read back hidden state from GPU.
+            if (g_timing_enabled) { t0 = now_ms(); }
+            finalize_deferred_experts();  // reads buf_moe_hidden -> hidden
+
+            // Start predicted expert preads AFTER CMD1_wait.
+            // CMD3(N-1) is guaranteed done (serial queue), so buf_B is safe to overwrite.
+            // Predictions overlap with CPU attn + CMD2 + routing (~0.6ms head start).
+            // Predicted experts that hit page cache (same as previous token) complete in ~0.1ms.
+            if (g_pred_enabled && g_pred_generating && g_pred_valid && packed_fd >= 0 &&
+                g_metal->buf_multi_expert_data_B[0] && g_pred_count[layer_idx] > 0) {
+                async_pread_start(packed_fd, g_pred_experts[layer_idx],
+                                  g_pred_count[layer_idx],
+                                  g_metal->buf_multi_expert_data_B, mmap_base);
+                pred_started = 1;
+            }
+            // Set up residual for CMD2 (residual = hidden before this layer's attention)
+            cpu_vec_copy(residual, hidden, HIDDEN_DIM);
+            if (g_timing_enabled) { t1 = now_ms(); g_timing.deferred_cpu += t1 - t0; }
         }
-        if (g_timing_enabled) { t1 = now_ms(); g_timing.cmd1_wait += t1 - t0; }
 
-        // Now CMD3(N-1) is done. Read back hidden state from GPU.
-        if (g_timing_enabled) { t0 = now_ms(); }
-        finalize_deferred_experts();  // reads buf_moe_hidden -> hidden
-
-        // Start predicted expert preads AFTER CMD1_wait.
-        // CMD3(N-1) is guaranteed done (serial queue), so buf_B is safe to overwrite.
-        // Predictions overlap with CPU attn + CMD2 + routing (~0.6ms head start).
-        // Predicted experts that hit page cache (same as previous token) complete in ~0.1ms.
-        if (g_pred_enabled && g_pred_generating && g_pred_valid && packed_fd >= 0 &&
-            g_metal->buf_multi_expert_data_B[0] && g_pred_count[layer_idx] > 0) {
-            async_pread_start(packed_fd, g_pred_experts[layer_idx],
-                              g_pred_count[layer_idx],
-                              g_metal->buf_multi_expert_data_B, mmap_base);
-            pred_started = 1;
+        if (g_timing_enabled && cmd12_merged) {
+            // cmd1_submit tracks encode cost even when commit is deferred to merged CMD12.
+            t1 = now_ms();
+            g_timing.cmd1_submit += t1 - t0;
         }
-        // Set up residual for CMD2 (residual = hidden before this layer's attention)
-        cpu_vec_copy(residual, hidden, HIDDEN_DIM);
-        if (g_timing_enabled) { t1 = now_ms(); g_timing.deferred_cpu += t1 - t0; }
 
         // No input_norm needed — CMD3 already computed it into buf_input.
         // normed is only needed if speculative routing is enabled (currently disabled).
@@ -4521,7 +4572,13 @@ static void fused_layer_forward(
             }
 #endif /* HAS_LINEAR_ATTENTION */
 
-            [cmd1 commit];
+            if (gpu_linear_attn && can_merge_cmd12_linear) {
+                cmd12 = cmd1;
+                cmd12_merged = 1;
+                cmd12_residual_from_moe_hidden = 0;
+            } else {
+                [cmd1 commit];
+            }
         } else {
             for (int i = 0; i < num_attn_specs; i++) {
                 BatchMatvecSpec *s = &attn_specs[i];
@@ -4536,15 +4593,17 @@ static void fused_layer_forward(
         }
         if (g_timing_enabled) { t1 = now_ms(); g_timing.cmd1_submit += t1 - t0; }
 
-        // Wait for CMD1
-        if (g_timing_enabled) { t0 = now_ms(); }
-        if (cmd1) {
-            [cmd1 waitUntilCompleted];
-            if (!gpu_linear_attn) {
-                gpu_flush_batch_results(g_metal, attn_specs, num_attn_specs);
+        // Wait for CMD1 unless merged CMD1+CMD2 path is active.
+        if (!cmd12_merged) {
+            if (g_timing_enabled) { t0 = now_ms(); }
+            if (cmd1) {
+                [cmd1 waitUntilCompleted];
+                if (!gpu_linear_attn) {
+                    gpu_flush_batch_results(g_metal, attn_specs, num_attn_specs);
+                }
             }
+            if (g_timing_enabled) { t1 = now_ms(); g_timing.cmd1_wait += t1 - t0; }
         }
-        if (g_timing_enabled) { t1 = now_ms(); g_timing.cmd1_wait += t1 - t0; }
     }
 
     // =====================================================================
@@ -5075,12 +5134,17 @@ static void fused_layer_forward(
                    oproj_in_dim * sizeof(float));
         }
         // gpu_linear_attn: batch_out[6] already has the result from CMD1 gated_rms_norm
-        // Copy residual into GPU buffer for residual_add kernel
-        memcpy([g_metal->buf_residual contents], residual, HIDDEN_DIM * sizeof(float));
+        // Fast merged path can consume residual directly from previous layer's GPU hidden.
+        id<MTLBuffer> residual_src = g_metal->buf_residual;
+        if (cmd12_merged && cmd12_residual_from_moe_hidden && g_metal->buf_moe_hidden) {
+            residual_src = g_metal->buf_moe_hidden;
+        } else {
+            memcpy([g_metal->buf_residual contents], residual, HIDDEN_DIM * sizeof(float));
+        }
 
         attn_out_for_oproj = NULL;
 
-        id<MTLCommandBuffer> cmd_fused = [g_metal->queue commandBuffer];
+        id<MTLCommandBuffer> cmd_fused = cmd12_merged ? cmd12 : [g_metal->queue commandBuffer];
 
         // ---- GPU attention dispatches (only for full-attn layers with GPU path) ----
         if (gpu_attn_fuse) {
@@ -5202,12 +5266,12 @@ static void fused_layer_forward(
             [enc endEncoding];
         }
 
-        // ---- Enc 2: residual_add (buf_output + buf_residual -> buf_h_mid) ----
+        // ---- Enc 2: residual_add (buf_output + residual -> buf_h_mid) ----
         {
             id<MTLComputeCommandEncoder> enc = [cmd_fused computeCommandEncoder];
             uint32_t dim = HIDDEN_DIM;
             [enc setComputePipelineState:g_metal->residual_add];
-            [enc setBuffer:g_metal->buf_residual offset:0 atIndex:0];  // a = residual
+            [enc setBuffer:residual_src         offset:0 atIndex:0];  // a = residual
             [enc setBuffer:g_metal->buf_output   offset:0 atIndex:1];  // b = o_proj result
             [enc setBuffer:g_metal->buf_h_mid    offset:0 atIndex:2];  // out = h_mid
             [enc setBytes:&dim length:4 atIndex:3];
@@ -5274,6 +5338,28 @@ static void fused_layer_forward(
         if (g_timing_enabled) { t0 = now_ms(); }
         [cmd_fused commit];
         [cmd_fused waitUntilCompleted];
+        if (cmd12_merged) {
+            // merged cmd12 wait guarantees previous deferred CMD3 is complete
+            // (same serial queue), so we can finalize now without an extra wait.
+            if (g_timing_enabled) { t1 = now_ms(); g_timing.cmd12_wait += t1 - t0; }
+            if (g_deferred.active) {
+                if (g_timing_enabled) { t0 = now_ms(); }
+                finalize_deferred_experts();
+
+                // Start predicted expert preads once the previous deferred layer is finalized.
+                if (g_pred_enabled && g_pred_generating && g_pred_valid && packed_fd >= 0 &&
+                    g_metal->buf_multi_expert_data_B[0] && g_pred_count[layer_idx] > 0) {
+                    async_pread_start(packed_fd, g_pred_experts[layer_idx],
+                                      g_pred_count[layer_idx],
+                                      g_metal->buf_multi_expert_data_B, mmap_base);
+                    pred_started = 1;
+                }
+                if (g_timing_enabled) { t1 = now_ms(); g_timing.deferred_cpu += t1 - t0; }
+            }
+            if (g_timing_enabled) { g_timing.cmd12_layers++; }
+        } else {
+            if (g_timing_enabled) { t1 = now_ms(); g_timing.cmd2_wait += t1 - t0; }
+        }
 
         // Read back results
         gpu_flush_batch_results(g_metal, moe_specs, num_moe_specs);
@@ -5283,7 +5369,6 @@ static void fused_layer_forward(
         memcpy(h_post, [g_metal->buf_input contents], HIDDEN_DIM * sizeof(float));
         // Update hidden state to h_mid (= residual + o_proj)
         memcpy(hidden, h_mid, HIDDEN_DIM * sizeof(float));
-        if (g_timing_enabled) { t1 = now_ms(); g_timing.cmd2_wait += t1 - t0; }
 
         // --- Post-CMD2 debug ---
         if (layer_idx <= 3 && pos == 0) {

@@ -47,6 +47,7 @@ Session result: working port at 9.7 tok/s warm steady-state. Commits `b82ac06..1
 | [parallelism-exploration.md](parallelism-exploration.md) | Why GPU is 50% utilized, why CPU looks single-core. Theoretical ceiling math. Top 3 wins ranked. |
 | [pipeline-guard-audit.md](pipeline-guard-audit.md) | Audit of Metal pipeline creation vs dispatch macro guards — sigmoid_gate_pipe-class bugs. None new found. |
 | [optimization-10x-ideas.md](optimization-10x-ideas.md) | 11 optimization paths researched (MTP, batched prefill, fused GPU, ICBs, int8 matmul, draft models, ANE, etc.). Honest ceiling ~58 tok/s (6×), not 10×. |
+| [fused-gpu-pass-performance.md](fused-gpu-pass-performance.md) | Rebench log for CMD1+CMD2 merged linear-attn path (3 passes, TTFT/tok-s + per-phase timing + merged-layer counters). |
 
 ## Optimizations tried
 
