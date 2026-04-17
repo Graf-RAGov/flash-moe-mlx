@@ -32,3 +32,10 @@ c222a4f	Qwen3.5-397B-A17B-4bit	397.0	17.0	4.10	0	5.5	discard	GPU LUT dequant ker
 c222a4f	Qwen3.5-397B-A17B-4bit	397.0	17.0	3.33	0	5.5	discard	GPU private buffer compression: blit shared→private before matvec. Isolated -13.5% but 4×7MB blit cost exceeds savings in pipeline.
 c222a4f	Qwen3.5-397B-A17B-4bit	397.0	17.0	3.91	0	5.5	discard	dispatch_io: -70% slower than pread (dispatch_data overhead kills it).
 c222a4f	Qwen3.5-397B-A17B-4bit	397.0	17.0	3.91	0	5.5	discard	Expert file clustering: NVMe doesn't care about scatter distance at 7MB read granularity. 0%.
+HEAD	Qwen3.6-35B-A3B-8bit	35.0	3.0	9.85	0	32.0	keep	Context benchmark baseline: K=4, 1-tok prompt, 30 gen, M1 Pro 32GB. RSS 261 MB flat; expert set in OS page cache. BLOCKER: seq_len>=32 segfaults in gpu_attn path (infer.m:4740). Full sweep impossible until fixed. See docs-research/benchmark-ram-tokspeed.md.
+HEAD	Qwen3.6-35B-A3B-8bit	35.0	3.0	8.08	53878	2.6	keep	Task #17 K sweep warm K=4 500ctx: prompt 498 tok gen 30 RSS 350MB pageins 1039MB fb_delta -17MB. M1Pro 32GB. Coherent Alice continuation.
+HEAD	Qwen3.6-35B-A3B-8bit	35.0	4.5	8.33	59239	2.6	keep	Task #17 K sweep warm K=6 500ctx: prompt 498 tok gen 30 RSS 351MB pageins 11074MB fb_delta -4MB. Fastest cell at 500 ctx but within noise of K=4.
+HEAD	Qwen3.6-35B-A3B-8bit	35.0	6.0	7.41	69178	2.6	keep	Task #17 K sweep warm K=8 500ctx: prompt 498 tok gen 30 RSS 351MB pageins 14071MB fb_delta -539MB. -8.3% vs K=4. Coherent output (no K=8 garble at 500 ctx).
+HEAD	Qwen3.6-35B-A3B-8bit	35.0	3.0	6.82	258179	2.6	keep	Task #17 K sweep warm K=4 2000ctx: prompt 2063 tok gen 30 RSS 631MB pageins 86705MB fb_delta -1826MB. Cache thrash even on warm run.
+HEAD	Qwen3.6-35B-A3B-8bit	35.0	4.5	6.25	259711	2.6	keep	Task #17 K sweep warm K=6 2000ctx: prompt 2063 tok gen 30 RSS 633MB pageins 56018MB. -8% vs K=4.
+HEAD	Qwen3.6-35B-A3B-8bit	35.0	6.0	5.89	272789	2.6	keep	Task #17 K sweep warm K=8 2000ctx: prompt 2063 tok gen 30 RSS 634MB pageins 92654MB. -13.6% vs K=4. Coherent output (confirms K=8 8K-garble is a ctx effect not K effect).
